@@ -1330,6 +1330,15 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+#if defined(LLAMA_KVMEM)
+        // The RAM prompt cache saves and restores native KV state. KVMem keeps its own
+        // store, which such a restore cannot rewind, so the two sides would diverge.
+        if (llama_kvmem_get_params()->enabled && params_base.cache_ram_mib != 0) {
+            SRV_WRN("%s", "prompt cache is disabled because KVMem manages the KV store\n");
+            params_base.cache_ram_mib = 0;
+        }
+#endif
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -3459,6 +3468,14 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+#if defined(LLAMA_KVMEM)
+                    if (llama_kvmem_get_params()->enabled) {
+                        // M-RoPE positions and cache rows diverge after media chunks: the
+                        // position based removal above can leave stale rows behind
+                        llama_kvmem_remove_logical(ctx_tgt, (llama_pos) slot.prompt.n_tokens(), -1);
+                    }
+#endif
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
@@ -3487,6 +3504,15 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
+
+#if defined(LLAMA_KVMEM)
+                    // The KVMem store is not part of a native context checkpoint: restoring
+                    // one rewinds the native KV without rewinding the store, which leaves
+                    // rows and positions inconsistent. KVMem manages its own prefix reuse.
+                    if (llama_kvmem_get_params()->enabled) {
+                        do_checkpoint = false;
+                    }
+#endif
 
                     bool has_mtmd = false;
 
