@@ -4,6 +4,7 @@
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 
@@ -583,30 +584,32 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }
 
-static __global__ void gdn_fold_f32(const ggml_cuda_gdn_replay_layer * layers, int n_keep) {
+static __global__ void gdn_fold_f32(const ggml_cuda_gdn_replay_layer * layers, int n_keep, int key_heads, int value_heads) {
+    constexpr int cols_per_warp = 4;
     constexpr int width = ggml_cuda_get_physical_warp_size();
-    constexpr int rows = 128 / width;
+    constexpr int lanes_per_col = width / cols_per_warp;
+    constexpr int rows = 128 / lanes_per_col;
     static_assert(width == 32 || width == 64, "unsupported GDN wave size");
     const auto layer = layers[blockIdx.y];
     const int head = blockIdx.x;
-    const int lane = threadIdx.x;
-    const int col = blockIdx.z * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x % lanes_per_col;
+    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp + threadIdx.x / lanes_per_col;
     float * state = layer.state + (head * 128 + col) * 128;
     float s[rows];
 #pragma unroll
     for (int r = 0; r < rows; ++r) {
-        s[r] = state[r * width + lane];
+        s[r] = state[r * lanes_per_col + lane];
     }
     for (int t = 0; t < n_keep; ++t) {
-        const float * key = layer.key + (t * 16 + head % 16) * 128;
+        const float * key = layer.key + (t * key_heads + head % key_heads) * 128;
         float k[rows];
 #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            k[r] = key[r * width + lane];
+            k[r] = key[r * lanes_per_col + lane];
         }
-        const float decay = expf(layer.gate[t * 48 + head]);
-        const float delta = gdn_delta_f32<rows, width>(s, k, decay,
-                layer.value[(t * 48 + head) * 128 + col], layer.beta[t * 48 + head]);
+        const float decay = expf(layer.gate[t * value_heads + head]);
+        const float delta = gdn_delta_f32<rows, lanes_per_col>(s, k, decay,
+                layer.value[(t * value_heads + head) * 128 + col], layer.beta[t * value_heads + head]);
 #pragma unroll
         for (int r = 0; r < rows; ++r) {
             s[r] = gdn_update_f32(s[r], k[r], decay, delta);
@@ -614,20 +617,20 @@ static __global__ void gdn_fold_f32(const ggml_cuda_gdn_replay_layer * layers, i
     }
 #pragma unroll
     for (int r = 0; r < rows; ++r) {
-        state[r * width + lane] = s[r];
+        state[r * lanes_per_col + lane] = s[r];
     }
 }
 
-static __global__ void gdn_conv_fold_f32(const ggml_cuda_gdn_replay_layer * layers, int n_keep) {
+static __global__ void gdn_conv_fold_f32(const ggml_cuda_gdn_replay_layer * layers, int n_keep, int channels) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
-    if (channel >= 10240) return;
+    if (channel >= channels) return;
     const auto layer = layers[blockIdx.y];
     float history[3];
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
         const int source = n_keep + i;
         history[i] = source < 3 ? layer.conv[channel * 3 + source]
-                                : layer.conv_input[(source - 3) * 10240 + channel];
+                                : layer.conv_input[(source - 3) * channels + channel];
     }
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
@@ -636,18 +639,22 @@ static __global__ void gdn_conv_fold_f32(const ggml_cuda_gdn_replay_layer * laye
 }
 
 bool ggml_backend_cuda_gdn_fold(const ggml_cuda_gdn_replay_layer * layers,
-        int n_layers, int n_keep, int capacity, void * stream_ptr) {
+        int n_layers, int n_keep, int capacity, int key_heads, int value_heads, void * stream_ptr) {
     if (n_keep == 0) return true;
-    if (!layers || n_layers <= 0 || n_keep < 0 || n_keep > capacity || capacity > 6) return false;
+    if (key_heads <= 0 || value_heads <= 0 || value_heads % key_heads != 0 ||
+            int64_t(2) * key_heads + value_heads > INT_MAX / 128 ||
+            n_keep < 0 || n_keep > capacity || capacity < 1 || capacity > 6) return false;
+    if (!layers || n_layers <= 0) return false;
+    const int channels = (2 * key_heads + value_heads) * 128;
     const auto stream = static_cast<cudaStream_t>(stream_ptr);
 #if defined(GGML_USE_HIP)
     const int width = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     if (width != 32 && width != 64) return false;
-    gdn_fold_f32<<<dim3(48, n_layers, 32), dim3(width, 4), 0, stream>>>(layers, n_keep);
+    gdn_fold_f32<<<dim3(value_heads, n_layers, 8), dim3(width, 4), 0, stream>>>(layers, n_keep, key_heads, value_heads);
 #else
-    gdn_fold_f32<<<dim3(48, n_layers, 32), dim3(32, 4), 0, stream>>>(layers, n_keep);
+    gdn_fold_f32<<<dim3(value_heads, n_layers, 8), dim3(32, 4), 0, stream>>>(layers, n_keep, key_heads, value_heads);
 #endif
     if (cudaGetLastError() != cudaSuccess) return false;
-    gdn_conv_fold_f32<<<dim3(40, n_layers), 256, 0, stream>>>(layers, n_keep);
+    gdn_conv_fold_f32<<<dim3((channels + 255) / 256, n_layers), 256, 0, stream>>>(layers, n_keep, channels);
     return cudaGetLastError() == cudaSuccess;
 }
