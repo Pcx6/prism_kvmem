@@ -6,6 +6,9 @@
 #include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "llama-io.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache.h"

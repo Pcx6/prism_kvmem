@@ -1302,10 +1302,6 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
-        logical_pos.resize(n_b);
-        batch.logical_pos = logical_pos.data();
-        synced_rows.assign(n_seq, 0);
-        verify_start.assign(n_seq, 0);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -2455,6 +2451,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
+        logical_pos.resize((size_t) llama_n_batch(ctx_dft));
+        batch.logical_pos = logical_pos.data();
+        synced_rows.assign(n_seq, 0);
+        verify_start.assign(n_seq, 0);
+
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
@@ -2762,6 +2763,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            llama_batch sync_batch = batch;
+            sync_batch.embd_nextn = batch.embd;
+            if (!batch_in.token) {
+                sync_batch.token = nullptr;
+                sync_batch.embd = batch_in.embd;
+                sync_batch.pos = batch_in.pos;
+            }
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;

@@ -1259,6 +1259,7 @@ json oaicompat_chat_params_parse(
 }
 
 // used by /chat/completions endpoint
+#if 0 // KVMEM_PATCH_DUPLICATE: prism has a newer oaicompat_chat_params_parse at line ~1129
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
@@ -1486,6 +1487,7 @@ json oaicompat_chat_params_parse(
 
     return llama_params;
 }
+#endif // KVMEM_PATCH_DUPLICATE
 
 json format_embeddings_response_oaicompat(
         const json & request,
