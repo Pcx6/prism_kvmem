@@ -3548,6 +3548,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_prompt = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PROMPT"));
+#if defined(LLAMA_KVMEM)
+    add_opt(common_arg(
+        {"--kvmem"},
+        {"--no-kvmem"},
+        string_format("enable the KVMem memory adapter (default: %s)", params.kvmem ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kvmem = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM"));
+    add_opt(common_arg(
+        {"--kvmem-budget"}, "N",
+        string_format("KVMem GPU working-set budget in tokens (default: %d)", params.kvmem_budget > 0 ? params.kvmem_budget : 32768),
+        [](common_params & params, int value) {
+            params.kvmem_budget = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_BUDGET"));
+    add_opt(common_arg(
+        {"--kvmem-gen-reserve"}, "N",
+        string_format("KVMem generation reserve in tokens (default: %d)", params.kvmem_gen_reserve > 0 ? params.kvmem_gen_reserve : 1024),
+        [](common_params & params, int value) {
+            params.kvmem_gen_reserve = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_GEN_RESERVE"));
+    add_opt(common_arg(
+        {"--kvmem-block-tokens"}, "N",
+        string_format("KVMem block size in tokens (default: %d)", params.kvmem_block_tokens > 0 ? params.kvmem_block_tokens : 32),
+        [](common_params & params, int value) {
+            params.kvmem_block_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_BLOCK_TOKENS"));
+    add_opt(common_arg(
+        {"--kvmem-method"}, "MODE",
+        "KVMem block selection method: retrieval or recency (default: retrieval)",
+        [](common_params & params, const std::string & value) {
+            params.kvmem_method = value == "recency" ? 0 : 1;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_METHOD"));
+#endif
     add_opt(common_arg(
         {"--cache-reuse"}, "N",
         string_format(

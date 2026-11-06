@@ -6,6 +6,9 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1453,6 +1456,28 @@ static bool common_params_offload_cuda(const common_params & params) {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+#if defined(LLAMA_KVMEM)
+    if (params.kvmem) {
+        llama_kvmem_params kp = {};
+        kp.enabled = true;
+        kp.budget        = params.kvmem_budget        > 0 ? (uint32_t) params.kvmem_budget        : 32768;
+        kp.gen_reserve   = params.kvmem_gen_reserve   > 0 ? (uint32_t) params.kvmem_gen_reserve   : 1024;
+        kp.block_tokens  = params.kvmem_block_tokens  > 0 ? (uint32_t) params.kvmem_block_tokens  : 32;
+        kp.sink_tokens   = params.kvmem_sink_tokens   > 0 ? (uint32_t) params.kvmem_sink_tokens   : 0;
+        kp.recent_tokens = params.kvmem_recent_tokens > 0 ? (uint32_t) params.kvmem_recent_tokens : 0;
+        kp.method        = params.kvmem_method >= 0 ? params.kvmem_method : 1;
+        kp.gpu_memory_ratio  = params.kvmem_gpu_ratio;
+        kp.cpu_bytes         = (uint64_t) params.kvmem_cpu_gb   << 30;
+        kp.payload_host_bytes = (uint64_t) params.kvmem_host_mib << 20;
+        kp.query_begin = -1;
+        kp.query_end   = -1;
+        kp.force_pos   = -1;
+        kp.lrfu_lambda       = 0.5;
+        kp.lrfu_top_fraction = 0.9;
+        kp.graph_alpha       = 0.2;
+        llama_kvmem_set_params(&kp);
+    }
+#endif
     auto & spec = params.speculative;
     if (!spec.draft.n_max_set && common_params_offload_cuda(params) &&
         std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec.types.end()) {

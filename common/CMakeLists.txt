@@ -138,6 +138,11 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+if (LLAMA_KVMEM)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_KVMEM=1)
+    target_include_directories(${TARGET} PRIVATE ${LLAMA_KVMEM_ROOT}/src/adapter)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
