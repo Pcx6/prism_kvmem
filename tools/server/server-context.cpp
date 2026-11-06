@@ -1774,7 +1774,12 @@ private:
 #if defined(LLAMA_KVMEM)
         {
             const llama_kvmem_params * kp = llama_kvmem_get_params();
-            const int64_t kvmem_threshold = (int64_t) kp->budget + kp->gen_reserve;
+            const int64_t kvmem_pool = (int64_t) kp->budget + kp->gen_reserve;
+            // stay below the pool high watermark: above it KVMem offloads, but a bypassed
+            // request has no host mirror, so it must fit without any pressure
+            const double kvmem_high = kp->gpu_high_watermark > 0.0f && kp->gpu_high_watermark <= 1.0f
+                    ? (double) kp->gpu_high_watermark : 0.95;
+            const int64_t kvmem_threshold = (int64_t) (kvmem_pool * kvmem_high);
             // a request that fits entirely in the GPU pool needs no host mirror, capture,
             // staging or retrieval: keep the native attention path only
             slot.kvmem_short_bypass = kp->enabled && kvmem_threshold > 0 &&
