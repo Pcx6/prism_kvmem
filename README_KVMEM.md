@@ -265,7 +265,18 @@ KVMem 的 `seq_pos_min` 返回原生行位置，触发 Prism 的 checkpoint 回�
   - 前缀截断在位置删除之后追加 `llama_kvmem_remove_logical` 行级清除，避免媒体行残留。
 - 复现：8K 文本 + 图片 + 8K 文本，随后多次更短前缀复用，3 轮即触发；修复后 12/12 请求通过。
 
-### 8.6 其他
+### 8.6 客户端点"停止"后 GPU 继续计算
+
+- 现象：Harness 点停止后前端流停止，但 14803 仍全速解码 5000 token，GPU 占用不回落。
+- 根因：
+  - `trim_proxy.mjs` 未监听客户端断连，客户端走了它仍保持上游连接；
+  - llama-server 生成循环从不轮询连接状态，HTTP 层虽然提供了 `req.should_stop`（`is_connection_closed`），但没有传入任务。
+- 修复（`9cfb691`，代理同步修改）：
+  - 代理：`req.aborted` / `res.close`（未正常结束）时 `upstreamReq.destroy()`，日志 `[abort] #N client closed connection`；
+  - server：`server_task` 携带 `should_stop`，`pre_decode()` 发现连接已断立即 `slot.release()`，日志 `client disconnected, releasing slot (n_tokens = ...)`。
+- 验证：生成 2 秒后断开，服务端在 n_tokens=185/251 处停止（不是 5000）；GPU 利用率 98% -> 0% 在 0.4 秒内；连续 3 次中断后普通请求与 SSE 均 200，无 hole、无 Context exceeded。
+
+### 8.7 其他
 
 - 服务器偶发忽略 SIGTERM，`kill` 无效时用 `kill -9`。
 - 用 `pkill -f 'trim_proxy.mjs'` 会匹配到执行命令本身，建议按端口/进程号精确杀。
