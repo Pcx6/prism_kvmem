@@ -233,6 +233,11 @@ struct server_slot {
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
+    // KVMem: short request fully resident in the GPU pool, skip capture/staging/retrieval
+    bool kvmem_short_bypass = false;
+    bool kvmem_force_full = false;  // first long turn after a bypassed one: rebuild the host mirror
+    bool kvmem_last_bypass = false; // survives reset(), drives the crossing guard above
+
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
@@ -349,6 +354,9 @@ struct server_slot {
 
         task_prev = std::move(task);
         task.reset();
+
+        kvmem_short_bypass = false;
+        kvmem_force_full = false;
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
@@ -1764,15 +1772,32 @@ private:
         slot.task = std::make_unique<const server_task>(std::move(task));
 
 #if defined(LLAMA_KVMEM)
-        // KVMem selection state is process-wide; set it on the loop thread right before this
-        // request is decoded so a request queued in the background cannot overwrite it.
-        llama_kvmem_set_request_span(
-                slot.task->params.kvmem_qbegin,
-                slot.task->params.kvmem_qend,
-                slot.task->params.kvmem_force);
-        if (slot.task->params.kvmem_qbegin >= 0) {
-            SLT_INF(slot, "KVMEM_REQUEST_SPAN begin=%d end=%d n_tokens=%d\n",
-                    slot.task->params.kvmem_qbegin, slot.task->params.kvmem_qend, slot.task->n_tokens());
+        {
+            const llama_kvmem_params * kp = llama_kvmem_get_params();
+            const int64_t kvmem_threshold = (int64_t) kp->budget + kp->gen_reserve;
+            // a request that fits entirely in the GPU pool needs no host mirror, capture,
+            // staging or retrieval: keep the native attention path only
+            slot.kvmem_short_bypass = kp->enabled && kvmem_threshold > 0 &&
+                    (int64_t) slot.task->n_tokens() < kvmem_threshold;
+            // going back to the staged path: the previous short turn filled no host mirror,
+            // so the first long turn must evaluate the whole prompt again
+            slot.kvmem_force_full = kp->enabled && !slot.kvmem_short_bypass && slot.kvmem_last_bypass;
+            slot.kvmem_last_bypass = slot.kvmem_short_bypass;
+        }
+        if (slot.kvmem_short_bypass) {
+            llama_kvmem_set_request_span(-1, -1, -1);
+            SLT_INF(slot, "KVMEM_SHORT_BYPASS tokens=%d\n", slot.task->n_tokens());
+        } else {
+            // KVMem selection state is process-wide; set it on the loop thread right before this
+            // request is decoded so a request queued in the background cannot overwrite it.
+            llama_kvmem_set_request_span(
+                    slot.task->params.kvmem_qbegin,
+                    slot.task->params.kvmem_qend,
+                    slot.task->params.kvmem_force);
+            if (slot.task->params.kvmem_qbegin >= 0) {
+                SLT_INF(slot, "KVMEM_REQUEST_SPAN begin=%d end=%d n_tokens=%d\n",
+                        slot.task->params.kvmem_qbegin, slot.task->params.kvmem_qend, slot.task->n_tokens());
+            }
         }
 #endif
 
@@ -3350,6 +3375,13 @@ private:
                             }
                         }
 
+#if defined(LLAMA_KVMEM)
+                        if (slot.kvmem_force_full) {
+                            SLT_INF(slot, "KVMEM_BYPASS_EXIT full prefill n_tokens=%d\n", slot.task->n_tokens());
+                            n_past = 0;
+                        }
+#endif
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
@@ -3363,6 +3395,10 @@ private:
                         llama_kvmem_begin_cached_turn();
                         if (n_past > 0) {
                             llama_kvmem_truncate_cached((uint32_t) n_past);
+                        }
+                        if (slot.kvmem_short_bypass) {
+                            // nothing can be evicted, so skip K/Q capture and the harvest copies
+                            llama_kvmem_end_prefill_capture();
                         }
 #endif
 
@@ -3808,14 +3844,18 @@ private:
 #if defined(LLAMA_KVMEM)
                 // Prefill is done: score the question against the cached blocks, pull the
                 // selected history back into GPU, then start generation over that view.
-                try {
-                    const auto & prompt_tokens = slot.prompt.tokens.get_tokens();
-                    llama_kvmem_end_prefill_capture();
-                    llama_kvmem_apply_retrieval(ctx_tgt);
-                    llama_kvmem_pin_working_set();
-                    llama_kvmem_attention_begin(prompt_tokens.data(), (uint32_t) prompt_tokens.size());
-                } catch (const std::exception & e) {
-                    SLT_ERR(slot, "KVMem retrieval failed: %s\n", e.what());
+                // Short requests stayed fully resident and skipped capture, so there is
+                // nothing to score or stage.
+                if (!slot.kvmem_short_bypass) {
+                    try {
+                        const auto & prompt_tokens = slot.prompt.tokens.get_tokens();
+                        llama_kvmem_end_prefill_capture();
+                        llama_kvmem_apply_retrieval(ctx_tgt);
+                        llama_kvmem_pin_working_set();
+                        llama_kvmem_attention_begin(prompt_tokens.data(), (uint32_t) prompt_tokens.size());
+                    } catch (const std::exception & e) {
+                        SLT_ERR(slot, "KVMem retrieval failed: %s\n", e.what());
+                    }
                 }
 #endif
 
