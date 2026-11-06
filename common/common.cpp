@@ -1476,6 +1476,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         kp.lrfu_top_fraction = 0.9;
         kp.graph_alpha       = 0.2;
         llama_kvmem_set_params(&kp);
+    } else {
+        llama_kvmem_set_params(nullptr);
     }
 #endif
     auto & spec = params.speculative;

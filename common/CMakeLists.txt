@@ -140,7 +140,9 @@ endif()
 
 if (LLAMA_KVMEM)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_KVMEM=1)
-    target_include_directories(${TARGET} PRIVATE ${LLAMA_KVMEM_ROOT}/src/adapter)
+    target_include_directories(${TARGET} PRIVATE
+        ${LLAMA_KVMEM_ROOT}/src/adapter
+        ${LLAMA_KVMEM_ROOT}/kvmem/include)
 endif()
 
 if (BUILD_SHARED_LIBS)

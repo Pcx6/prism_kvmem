@@ -636,7 +636,7 @@ struct common_params {
     int32_t kvmem_gen_reserve   = 0;     // append workspace tokens; 0 = 1024
     int32_t kvmem_block_tokens  = 0;     // block size; 0 = 32
     int32_t kvmem_sink_tokens   = 0;     // always-kept prefix tokens; 0 = one block
-    int32_t kvmem_recent_tokens = 0;     // always-kept newest suffix tokens
+    int32_t kvmem_recent_tokens = 64;    // always-kept newest suffix tokens
     int32_t kvmem_method        = -1;    // -1 = retrieval, 0 = recency
     int32_t kvmem_host_mib      = 0;     // host KV quota in MiB; 0 = unlimited
     int32_t kvmem_cpu_gb        = 0;     // CPU spill arena in GiB; 0 = off
