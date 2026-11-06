@@ -3291,7 +3291,13 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // KVMem keeps its own history and does not expose native positional coverage,
+                                // so the checkpoint fallback below cannot judge it; skipping keeps prefix reuse.
+                                bool kvmem_managed_history = false;
+#if defined(LLAMA_KVMEM)
+                                kvmem_managed_history = llama_kvmem_get_params()->enabled;
+#endif
+                                if (pos_min >= pos_min_thold && !kvmem_managed_history) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3350,6 +3356,15 @@ private:
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
+
+#if defined(LLAMA_KVMEM)
+                        // KVMem keeps its own host mirror: start a cached turn and align the store
+                        // with the token prefix the server is about to reuse.
+                        llama_kvmem_begin_cached_turn();
+                        if (n_past > 0) {
+                            llama_kvmem_truncate_cached((uint32_t) n_past);
+                        }
+#endif
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
@@ -3789,6 +3804,20 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+#if defined(LLAMA_KVMEM)
+                // Prefill is done: score the question against the cached blocks, pull the
+                // selected history back into GPU, then start generation over that view.
+                try {
+                    const auto & prompt_tokens = slot.prompt.tokens.get_tokens();
+                    llama_kvmem_end_prefill_capture();
+                    llama_kvmem_apply_retrieval(ctx_tgt);
+                    llama_kvmem_pin_working_set();
+                    llama_kvmem_attention_begin(prompt_tokens.data(), (uint32_t) prompt_tokens.size());
+                } catch (const std::exception & e) {
+                    SLT_ERR(slot, "KVMem retrieval failed: %s\n", e.what());
+                }
+#endif
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
@@ -4309,18 +4338,39 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // positions. Prefix tokenization matches the full prompt tokenization used above.
             if (data.contains("kvmem_user_text") && data.at("prompt").is_string()) {
                 const std::string ptext = data.at("prompt").get<std::string>();
-                const std::string utext = data.at("kvmem_user_text").get<std::string>();
-                const size_t pos = ptext.rfind(utext);
+                std::string utext = data.at("kvmem_user_text").get<std::string>();
+                size_t pos = ptext.rfind(utext);
+                // templates may trim trailing whitespace from the message, retry on the trimmed text
+                if (pos == std::string::npos) {
+                    while (!utext.empty() && (utext.back() == '\n' || utext.back() == '\r' || utext.back() == ' ' || utext.back() == '\t')) {
+                        utext.pop_back();
+                    }
+                    if (!utext.empty()) {
+                        pos = ptext.rfind(utext);
+                    }
+                }
                 if (pos != std::string::npos) {
                     const auto tokens_pre  = common_tokenize(ctx_server.vocab, ptext.substr(0, pos), true, true);
                     const auto tokens_thru = common_tokenize(ctx_server.vocab, ptext.substr(0, pos + utext.size()), true, true);
                     task.params.kvmem_qbegin = (int32_t) tokens_pre.size();
                     task.params.kvmem_qend   = (int32_t) std::min<size_t>(tokens_thru.size(), task.tokens.size());
-                    if (task.params.kvmem_qend <= task.params.kvmem_qbegin) {
-                        task.params.kvmem_qbegin = -1;
-                        task.params.kvmem_qend   = -1;
-                    }
                 }
+            }
+            // a long document and its question can share one user message, and templates may
+            // rewrite the text so the match can fail: score only the prompt tail, which is the
+            // question, mirroring the reference server's 512-token --kvmem-query-max-tokens tail
+            if (task.params.kvmem_qbegin < 0) {
+                const int32_t n_tokens = (int32_t) task.tokens.size();
+                constexpr int32_t kvmem_query_max_tokens = 512;
+                task.params.kvmem_qbegin = std::max(0, n_tokens - kvmem_query_max_tokens);
+                task.params.kvmem_qend   = n_tokens;
+            }
+            if (task.params.kvmem_qend > task.params.kvmem_qbegin) {
+                constexpr int32_t kvmem_query_max_tokens = 512;
+                task.params.kvmem_qbegin = std::max(task.params.kvmem_qbegin, task.params.kvmem_qend - kvmem_query_max_tokens);
+            } else {
+                task.params.kvmem_qbegin = -1;
+                task.params.kvmem_qend   = -1;
             }
 #endif
 
