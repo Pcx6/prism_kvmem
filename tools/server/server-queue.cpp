@@ -358,6 +358,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     break; // new task arrived or terminate
                 }
                 // otherwise, loop again to check sleeping condition
+                if (callback_idle_tick) {
+                    lock.unlock();
+                    callback_idle_tick();
+                    lock.lock();
+                }
             }
         }
     }

@@ -11,8 +11,12 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "ggml-backend.h"
 #if defined(LLAMA_KVMEM)
 #include "llama-kvmem-hooks.h"
+#endif
+#if defined(__GLIBC__)
+#include <malloc.h>
 #endif
 #include "log.h"
 #include "sampling.h"
@@ -901,6 +905,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // rate limit for the KVMem idle TTL scan
+    int64_t t_kvmem_ttl_check = 0;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1401,6 +1408,9 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+        });
+        queue_tasks.on_idle_tick([this]() {
+            kvmem_idle_tick();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2789,6 +2799,85 @@ private:
     };
 #endif
 
+    // Drop the KV of idle slots, either on the idle TTL or under memory pressure.
+#if defined(LLAMA_KVMEM)
+    // Housekeeping that must also run while the server waits for new tasks.
+    void kvmem_idle_tick() {
+        if (!llama_kvmem_get_params()->enabled) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        if (params_base.kvmem_idle_ttl > 0 && now - t_kvmem_ttl_check > 1000000) {
+            t_kvmem_ttl_check = now;
+            kvmem_evict_idle_slots("idle_ttl", (int64_t) params_base.kvmem_idle_ttl * 1000000, false);
+        }
+        if (kvmem_memory_low()) {
+            kvmem_evict_idle_slots("oom_guard", 0, true);
+        }
+    }
+
+    bool kvmem_evict_idle_slots(const char * reason, int64_t ttl_us, bool force) {
+        bool any = false;
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                continue;
+            }
+            if (slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (!force) {
+                if (ttl_us <= 0 || slot.t_last_used <= 0) {
+                    continue;
+                }
+                if (ggml_time_us() - slot.t_last_used < ttl_us) {
+                    continue;
+                }
+            }
+            const int64_t idle_ms = slot.t_last_used > 0 ? (ggml_time_us() - slot.t_last_used) / 1000 : -1;
+            SLT_WRN(slot, "KVMEM_IDLE_EVICT reason=%s idle_ms=%lld n_tokens=%d\n",
+                    reason, (long long) idle_ms, slot.prompt.n_tokens());
+            slot.prompt_clear();
+            slot.t_last_used = ggml_time_us();
+            any = true;
+        }
+#if defined(__GLIBC__)
+        if (any) {
+            malloc_trim(0);
+        }
+#endif
+        return any;
+    }
+
+    bool kvmem_memory_low() const {
+        long avail_kb = -1;
+        if (FILE * f = fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (sscanf(line, "MemAvailable: %ld kB", &avail_kb) == 1) {
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (avail_kb >= 0 && (int64_t) avail_kb * 1024 < (int64_t) 1536 * 1024 * 1024) {
+            return true;
+        }
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            size_t free_b = 0;
+            size_t total_b = 0;
+            ggml_backend_dev_memory(dev, &free_b, &total_b);
+            if (free_b > 0 && free_b < (size_t) 1024 * 1024 * 1024) {
+                return true;
+            }
+        }
+        return false;
+    }
+#endif
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3728,12 +3817,44 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        bool decode_failed_alloc = false;
+        std::string decode_error;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            try {
+                ret = llama_decode(ctx_tgt, batch_view);
+            } catch (const std::exception & e) {
+                decode_failed_alloc = true;
+                decode_error = e.what();
+                ret = -2;
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+
+#if defined(LLAMA_KVMEM)
+        // allocation failure: drop idle KV and retry the same batch once
+        if (decode_failed_alloc && llama_kvmem_get_params()->enabled &&
+                kvmem_evict_idle_slots("oom_retry", 0, true)) {
+            SRV_WRN("%s", "decode allocation failed: evicted idle KV, retrying the batch\n");
+            decode_failed_alloc = false;
+            queue_tasks.yield_to_queue([&]() {
+                try {
+                    ret = llama_decode(ctx_tgt, batch_view);
+                } catch (const std::exception & e) {
+                    decode_failed_alloc = true;
+                    decode_error = e.what();
+                    ret = -2;
+                }
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
+#endif
+        if (decode_failed_alloc) {
+            throw std::runtime_error("decode failed: " + decode_error);
+        }
 
         if (ret != 0) {
             {

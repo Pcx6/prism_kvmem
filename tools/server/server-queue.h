@@ -44,6 +44,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle_tick;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -125,6 +126,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register a function to be called once per idle wait timeout (about 1 s)
+    // while the main loop waits for new tasks; used for time based housekeeping.
+    void on_idle_tick(std::function<void(void)> callback) {
+        callback_idle_tick = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

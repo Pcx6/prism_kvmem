@@ -3585,6 +3585,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kvmem_method = value == "recency" ? 0 : 1;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_METHOD"));
+    add_opt(common_arg(
+        {"--kvmem-idle-ttl"}, "SECONDS",
+        string_format("evict a slot's KVMem KV after this many idle seconds, 0 disables (default: %d)", params.kvmem_idle_ttl),
+        [](common_params & params, int value) {
+            params.kvmem_idle_ttl = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_IDLE_TTL"));
 #endif
     add_opt(common_arg(
         {"--cache-reuse"}, "N",
