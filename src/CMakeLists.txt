@@ -68,6 +68,7 @@ if (LLAMA_KVMEM)
     endif()
     target_sources(llama PRIVATE
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp
+        ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-attention.cpp
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-hybrid.cpp
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem-mtp.cpp
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-batch.cpp
@@ -76,6 +77,7 @@ if (LLAMA_KVMEM)
     if (GGML_CUDA)
         enable_language(CUDA)
         target_sources(llama PRIVATE
+            ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-attention-cuda.cu
             ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein.cu)
         if (DEFINED CMAKE_CUDA_ARCHITECTURES)
             set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
