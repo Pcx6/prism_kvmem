@@ -74,6 +74,9 @@ if (LLAMA_KVMEM)
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-batch.cpp
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-capture.cpp
     )
+    # adapter sources come from a newer ggml API; this header adds the missing generic setter
+    set_source_files_properties(${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-attention.cpp
+        PROPERTIES COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/kvmem-compat.h")
     if (GGML_CUDA)
         enable_language(CUDA)
         target_sources(llama PRIVATE
