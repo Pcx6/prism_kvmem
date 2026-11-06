@@ -1,0 +1,1196 @@
+#include "norm.cuh"
+#include "fwht.cuh"
+#include <cstdint>
+
+template <int block_size>
+static __global__ void norm_f32(
+        const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float2 mean_var = make_float2(0.0f, 0.0f);
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        mean_var.x += xi;
+        mean_var.y += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float2 s_sum2[];
+    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
+
+    const float mean = mean_var.x / ncols;
+    const float var = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = (x[col] - mean) * inv_std;
+    }
+}
+
+template <int block_size>
+static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
+    // blockIdx.x: num_groups idx
+    // threadIdx.x: block_size idx
+    const int start =     blockIdx.x*group_size + threadIdx.x;
+    const int end   = min(blockIdx.x*group_size + group_size,  ne_elements);
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int j = start; j < end; j += block_size) {
+        tmp += x[j];
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / group_size;
+    tmp = 0.0f;
+
+    for (int j = start; j < end; j += block_size) {
+        const float xi = x[j] - mean;
+        dst[j] = xi;
+        tmp += xi * xi;
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum + 32);
+
+    const float variance = tmp / group_size;
+    const float scale = rsqrtf(variance + eps);
+    for (int j = start; j < end; j += block_size) {
+        dst[j] *= scale;
+    }
+}
+
+template <int block_size, bool do_multiply = false, bool do_add = false>
+static __global__ void rms_norm_f32(const float * x,
+                                    float *       dst,
+                                    const int     ncols,
+                                    const int64_t stride_row,
+                                    const int64_t stride_channel,
+                                    const int64_t stride_sample,
+                                    const float   eps,
+                                    const float * mul                  = nullptr,
+                                    const int64_t mul_stride_row       = 0,
+                                    const int64_t mul_stride_channel   = 0,
+                                    const int64_t mul_stride_sample    = 0,
+                                    const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
+                                    const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
+                                    const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
+                                    const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
+                                    const float * add                  = nullptr,
+                                    const int64_t add_stride_row       = 0,
+                                    const int64_t add_stride_channel   = 0,
+                                    const int64_t add_stride_sample    = 0,
+                                    const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                    const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                    const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const int add_row     = fastmodulo(row, add_nrows_packed);
+        const int add_channel = fastmodulo(channel, add_nchannels_packed);
+        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        if constexpr (do_multiply && do_add) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const int add_col = fastmodulo(col, add_ncols_packed);
+            dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
+        } else if constexpr (do_multiply) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            dst[col]          = scale * x[col] * mul[mul_col];
+        } else {
+            dst[col] = scale * x[col];
+        }
+    }
+}
+
+template <int block_size>
+static __global__ void add_rms_norm_f32(
+        const float * a, const float * b, const float * weight, float * sum, float * dst,
+        const int ncols, const float eps) {
+    const int64_t row = (int64_t) blockIdx.z*gridDim.y*gridDim.x +
+                        (int64_t) blockIdx.y*gridDim.x + blockIdx.x;
+    const int tid = threadIdx.x;
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+    dst += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(a[col], b[col]);
+        sum[col] = xi;
+        tmp += xi*xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp/ncols + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale*sum[col]*weight[col];
+    }
+}
+
+template <int block_size>
+static __global__ void add_rms_norm_scale_f32(
+        const float * a, const float * b, float * sum, float * row_scale,
+        const int ncols, const float eps) {
+    const int64_t row = (int64_t) blockIdx.z*gridDim.y*gridDim.x +
+                        (int64_t) blockIdx.y*gridDim.x + blockIdx.x;
+    const int tid = threadIdx.x;
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(a[col], b[col]);
+        sum[col] = xi;
+        tmp += xi*xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    if (tid == 0) {
+        row_scale[row] = rsqrtf(tmp/ncols + eps);
+    }
+}
+
+template <int block_size>
+static __global__ void rms_norm_back_f32(
+        const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+    const int row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    grad += int64_t(row)*ncols;
+    xf   += int64_t(row)*ncols;
+    dst  += int64_t(row)*ncols;
+
+    float sum_xx = 0.0f; // sum for squares of x, equivalent to forward pass
+    float sum_xg = 0.0f; // sum for x * gradient, needed because RMS norm mixes inputs
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xfi = xf[col];
+        sum_xx += xfi * xfi;
+        sum_xg += xfi * grad[col];
+    }
+
+    // sum up partial sums
+    sum_xx = warp_reduce_sum(sum_xx);
+    sum_xg = warp_reduce_sum(sum_xg);
+    if constexpr (block_size > WARP_SIZE) {
+        static_assert(block_size == 1024, "unexpected block_size");
+        __shared__ float s_sum_xx[32];
+        __shared__ float s_sum_xg[32];
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum_xx[warp_id] = sum_xx;
+            s_sum_xg[warp_id] = sum_xg;
+        }
+        __syncthreads();
+
+        sum_xx = s_sum_xx[lane_id];
+        sum_xx = warp_reduce_sum(sum_xx);
+
+        sum_xg = s_sum_xg[lane_id];
+        sum_xg = warp_reduce_sum(sum_xg);
+    }
+
+    const float mean_eps = sum_xx / ncols + eps;
+    const float sum_eps  = sum_xx + ncols*eps;
+
+    const float scale_grad = rsqrtf(mean_eps);
+    const float scale_x    = -scale_grad * sum_xg/sum_eps;
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale_grad*grad[col] + scale_x*xf[col];
+    }
+}
+
+// template <int block_size>
+// static __global__ void l2_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
+//     const int row = blockIdx.x*blockDim.y + threadIdx.y;
+//     const int tid = threadIdx.x;
+
+//     float tmp = 0.0f; // partial sum for thread in warp
+
+//     for (int col = tid; col < ncols; col += block_size) {
+//         const float xi = x[row*ncols + col];
+//         tmp += xi * xi;
+//     }
+
+//     // sum up partial sums
+//     tmp = warp_reduce_sum(tmp);
+//     if (block_size > WARP_SIZE) {
+//         __shared__ float s_sum[32];
+//         int warp_id = threadIdx.x / WARP_SIZE;
+//         int lane_id = threadIdx.x % WARP_SIZE;
+//         if (lane_id == 0) {
+//             s_sum[warp_id] = tmp;
+//         }
+//         __syncthreads();
+//         tmp = s_sum[lane_id];
+//         tmp = warp_reduce_sum(tmp);
+//     }
+
+//     // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
+//     const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+//     for (int col = tid; col < ncols; col += block_size) {
+//         dst[row*ncols + col] = scale * x[row*ncols + col];
+//     }
+// }
+
+template <int block_size>
+static __global__ void l2_norm_f32(
+        const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * x[col];
+    }
+}
+
+static void norm_f32_cuda(
+        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    }
+}
+
+static void group_norm_f32_cuda(
+        const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
+    if (group_size < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        group_norm_f32<WARP_SIZE><<<num_groups, block_dims, 0, stream>>>(x, dst, group_size, ne_elements, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        group_norm_f32<1024><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 2 * 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
+    }
+}
+
+static void rms_norm_f32_cuda(
+        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    static const bool rms128_enabled = [] {
+        const char * env = getenv("GGML_CUDA_GB10_RMS128");
+        return !env || std::atoi(env) != 0;
+    }();
+    const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+        ncols <= 128 && rms128_enabled;
+    if (use_rms128) {
+        const dim3 block_dims(128, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_f32<128, false>, launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+    } else if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(rms_norm_f32<256, false>, launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(rms_norm_f32<1024, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+    }
+}
+
+static void rms_norm_mul_f32_cuda(const float *  x,
+                                  const float *  mul,
+                                  const float *  add,
+                                  float *        dst,
+                                  const int      ncols,
+                                  const int      nrows,
+                                  const int      nchannels,
+                                  const int      nsamples,
+                                  const int64_t  stride_row,
+                                  const int64_t  stride_channel,
+                                  const int64_t  stride_sample,
+                                  const int64_t  mul_stride_row,
+                                  const int64_t  mul_stride_channel,
+                                  const int64_t  mul_stride_sample,
+                                  const uint32_t mul_ncols,
+                                  const uint32_t mul_nrows,
+                                  const uint32_t mul_nchannels,
+                                  const uint32_t mul_nsamples,
+                                  const int64_t  add_stride_row,
+                                  const int64_t  add_stride_channel,
+                                  const int64_t  add_stride_sample,
+                                  const uint32_t add_ncols,
+                                  const uint32_t add_nrows,
+                                  const uint32_t add_nchannels,
+                                  const uint32_t add_nsamples,
+                                  const float    eps,
+                                  cudaStream_t   stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (mul == nullptr) {
+        rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+        return;
+    }
+    if (add == nullptr) {
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+        static const bool rms128_enabled = [] {
+            const char * env = getenv("GGML_CUDA_GB10_RMS128");
+            return !env || std::atoi(env) != 0;
+        }();
+        const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+            ncols <= 128 && rms128_enabled;
+        if (use_rms128) {
+            const dim3 block_dims(128, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<128, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                // underlying cudaLaunchKernelEx does not support default params
+            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        } else if (ncols < 1024) {
+            const dim3 block_dims(256, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                // underlying cudaLaunchKernelEx does not support default params
+            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                // underlying cudaLaunchKernelEx does not support default params
+            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        }
+    } else {
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+
+        const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
+        const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
+        const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
+        const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+        if (ncols < 1024) {
+            const dim3 block_dims(256, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                add_nchannels_packed, add_nsamples_packed);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                add_nchannels_packed, add_nsamples_packed);
+        }
+    }
+}
+
+static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+    }
+}
+
+static void l2_norm_f32_cuda(
+        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(l2_norm_f32<WARP_SIZE>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(l2_norm_f32<1024>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    }
+}
+
+void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *)src0->data;
+    float * dst_d = (float *)dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    int num_groups = dst->op_params[0];
+
+    float eps;
+    memcpy(&eps, dst->op_params + 1, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+    group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
+}
+
+void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_add_rms_norm_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    GGML_ASSERT(a && b && rms_norm->src[0] == add && mul);
+    const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    GGML_ASSERT(mul->src[0] == rms_norm || mul->src[1] == rms_norm);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 &&
+                weight->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, add) &&
+                ggml_are_same_shape(add, rms_norm) && ggml_are_same_shape(rms_norm, mul));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                ggml_is_contiguous(add) && ggml_is_contiguous(rms_norm) &&
+                ggml_is_contiguous(weight) && ggml_is_contiguous(mul));
+    GGML_ASSERT(weight->ne[0] == add->ne[0] && ggml_nrows(weight) == 1);
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = add->ne[0];
+    const dim3 grid(add->ne[1], add->ne[2], add->ne[3]);
+    cudaStream_t stream = ctx.stream();
+    if (ncols < 1024) {
+        add_rms_norm_f32<256><<<grid, 256, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (const float *) weight->data,
+            (float *) add->data, (float *) mul->data, ncols, eps);
+    } else {
+        add_rms_norm_f32<1024><<<grid, 1024, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (const float *) weight->data,
+            (float *) add->data, (float *) mul->data, ncols, eps);
+    }
+}
+
+// [Residual ADD +] RMS_NORM + MUL(weight) + Hadamard sign flip + FWHT, one row per block (the FFN input of
+// every Bonsai 2 layer, and any other norm whose only consumer is a rotated matmul). Same arithmetic in the
+// same order as add_rms_norm_f32<1024> (or rms_norm_f32<1024> with the multiply) followed by fwht_cuda_block with
+// signs, so the result is bit-identical. The normalized row is also stored when other nodes read it:
+// thread tid holds elements tid + i*1024 for both the norm loop and the butterfly, and the butterfly stages
+// run in ascending stride order whatever the block width (ggml_cuda_fwht_block_butterfly).
+//
+// With q8 the transformed row is not stored in F32 but quantized to q8_1 straight away, in the layout the consuming
+// mat-vecs expect (AOS: 1 column; PQ2: the PQ2_0 multi-column path), with the same per-32 arithmetic and stores as
+// quantize_q8_1<layout>, so the q8_1 rows are bit-identical to quantizing the F32 result. dst then holds the q8_1 rows
+// (N/32 block_q8_1 per row, the row width needs no padding).
+template <int N, int B, bool has_add, bool q8, ggml_cuda_q8_1_layout layout>
+static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
+        const float * a, const float * b, const float * weight, const float * signs,
+        float * sum, float * normed, void * dst_ptr, const float eps, const float fwht_scale) {
+    constexpr int NT = 1024;
+    constexpr int NE = N / NT;
+    static_assert(N % NT == 0, "transform width must be a multiple of the block");
+
+    __shared__ float s_sum[32];
+    __shared__ float s_fwht[N];
+
+    const int64_t row = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid % ggml_cuda_get_physical_warp_size();
+    a   += row*N;
+    if constexpr (has_add) {
+        b   += row*N;
+        sum += row*N;
+    }
+    if (normed) {
+        normed += row*N;
+    }
+
+    float x[NE];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int col = i*NT + tid;
+        float xi;
+        if constexpr (has_add) {
+            xi = __fadd_rn(a[col], b[col]);
+            sum[col] = xi;
+        } else {
+            xi = a[col];
+        }
+        x[i] = xi;
+        tmp += xi*xi;
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, NT>(tmp, s_sum);
+    const float scale = rsqrtf(tmp/N + eps);
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int col = i*NT + tid;
+        reg[i]  = scale*x[i]*weight[col];
+        if (normed) {
+            normed[col] = reg[i];
+        }
+        reg[i]  = reg[i]*fwht_scale;
+        reg[i] *= signs[col];
+    }
+
+    ggml_cuda_fwht_block_butterfly<N, NT, B>(reg, s_fwht, tid, lane);
+
+    if constexpr (!q8) {
+        float * dst = (float *) dst_ptr + row*N;
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            dst[i*NT + tid] = reg[i];
+        }
+    } else {
+        static_assert(layout == GGML_CUDA_Q8_1_AOS || layout == GGML_CUDA_Q8_1_PQ2, "unsupported q8_1 layout");
+        char * ycol = (char *) dst_ptr + row*(N/QK8_1)*sizeof(block_q8_1);
+        const int iqs = lane % QK8_1;
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            const float xi = reg[i];
+            const int   kb = (i*NT + tid) / QK8_1;
+
+            float amax = fabsf(xi);
+            float bsum = xi;
+            amax = warp_reduce_max<QK8_1>(amax);
+            bsum = warp_reduce_sum<QK8_1>(bsum);
+
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+            if constexpr (layout == GGML_CUDA_Q8_1_PQ2) {
+                const int e = iqs;
+                ((int8_t *) ycol)[kb*QK8_1 + (e / 16)*16 + (e % 4)*4 + (e % 16)/4] = q;
+                int isum = q;
+                isum = warp_reduce_sum<QK8_1>(isum);
+                if (iqs == 0) {
+                    ((half2 *) (ycol + N))[kb] = make_half2(__float2half(d), __short_as_half((short) isum));
+                }
+            } else {
+                block_q8_1 * y = (block_q8_1 *) ycol + kb;
+                y->qs[iqs] = q;
+                if (iqs == 0) {
+                    y->ds = make_half2(d, bsum);
+                }
+            }
+        }
+    }
+}
+
+// ncols: the row width; blk: the Hadamard block width (the transform matrix is blk x blk, applied to each blk-element
+// segment of the row; blk == ncols for a full-row transform)
+bool ggml_cuda_add_rms_norm_fwht_supported(const int ncols, const int blk) {
+    return (ncols == 1024 || ncols == 2048 || ncols == 4096) &&
+           (blk == 512 || blk == 1024 || blk == 2048 || blk == 4096) && blk <= ncols;
+}
+
+void ggml_cuda_op_add_rms_norm_fwht_fused(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * add, const ggml_tensor * rms_norm,
+        const ggml_tensor * weight, const ggml_tensor * signs, ggml_tensor * normed, ggml_tensor * dst,
+        void * q8, ggml_cuda_q8_1_layout q8_layout) {
+    // without an ADD the norm reads its own source
+    const ggml_tensor * x = add ? add : rms_norm->src[0];
+    const ggml_tensor * a = add ? add->src[0] : x;
+    const ggml_tensor * b = add ? add->src[1] : nullptr;
+    const int ncols = (int) x->ne[0];
+    const int blk   = (int) dst->src[0]->ne[0];
+    GGML_ASSERT(ggml_cuda_add_rms_norm_fwht_supported(ncols, blk));
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(x));
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    // fwht_dispatch: scale = 1 / sqrtf(n), n the transform width
+    const float fwht_scale = 1 / sqrtf(blk);
+    const int64_t nrows = ggml_nrows(x);
+    cudaStream_t stream = ctx.stream();
+    float * normed_d = normed ? (float *) normed->data : nullptr;
+    void * out = q8 ? q8 : dst->data;
+#define ARF_LAUNCH(NN, BB, ADD, Q8, L) \
+    add_rms_norm_fwht_f32<NN, BB, ADD, Q8, L><<<(unsigned) nrows, 1024, 0, stream>>>( \
+        (const float *) a->data, ADD ? (const float *) b->data : nullptr, (const float *) weight->data, \
+        (const float *) signs->data, ADD ? (float *) add->data : nullptr, normed_d, out, eps, fwht_scale)
+#define ARF_CASE_ADD(NN, BB, ADD) \
+    if (!q8) { \
+        ARF_LAUNCH(NN, BB, ADD, false, GGML_CUDA_Q8_1_AOS); \
+    } else if (q8_layout == GGML_CUDA_Q8_1_PQ2) { \
+        ARF_LAUNCH(NN, BB, ADD, true, GGML_CUDA_Q8_1_PQ2); \
+    } else { \
+        GGML_ASSERT(q8_layout == GGML_CUDA_Q8_1_AOS); \
+        ARF_LAUNCH(NN, BB, ADD, true, GGML_CUDA_Q8_1_AOS); \
+    }
+#define ARF_CASE_B(NN, BB) \
+    if (blk == BB) { \
+        if (add) { \
+            ARF_CASE_ADD(NN, BB, true) \
+        } else { \
+            ARF_CASE_ADD(NN, BB, false) \
+        } \
+        return; \
+    }
+    switch (ncols) {
+        case 1024: ARF_CASE_B(1024, 512) ARF_CASE_B(1024, 1024) break;
+        case 2048: ARF_CASE_B(2048, 512) ARF_CASE_B(2048, 1024) ARF_CASE_B(2048, 2048) break;
+        case 4096: ARF_CASE_B(4096, 512) ARF_CASE_B(4096, 1024) ARF_CASE_B(4096, 2048) ARF_CASE_B(4096, 4096) break;
+        default: break;
+    }
+    GGML_ABORT("unsupported width %d / block %d", ncols, blk);
+#undef ARF_CASE_B
+#undef ARF_CASE_ADD
+#undef ARF_LAUNCH
+}
+
+void ggml_cuda_op_add_rms_norm_scale_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, float * row_scale) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    GGML_ASSERT(a && b && rms_norm->src[0] == add && row_scale);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, add) &&
+                ggml_are_same_shape(add, rms_norm));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                ggml_is_contiguous(add));
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = add->ne[0];
+    const dim3 grid(add->ne[1], add->ne[2], add->ne[3]);
+    cudaStream_t stream = ctx.stream();
+    if (ncols < 1024) {
+        add_rms_norm_scale_f32<256><<<grid, 256, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (float *) add->data,
+            row_scale, ncols, eps);
+    } else {
+        add_rms_norm_scale_f32<1024><<<grid, 1024, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (float *) add->data,
+            row_scale, ncols, eps);
+    }
+}
+
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+    const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+    float eps = 0.0f;
+
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float * src0_d = (const float *) rms_norm_src->data;
+    const float * mul_d = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    if (mul_tensor->src[0] == dst) {
+        mul_d = (float *) mul_tensor->src[1]->data;
+        mul_src = mul_tensor->src[1];
+    } else if(mul_tensor->src[1] == dst) {
+        mul_d = (float *) mul_tensor->src[0]->data;
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float * dst_d = (float *) mul_tensor->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t ne00 = rms_norm_src->ne[0];
+    const int64_t ne01 = rms_norm_src->ne[1];
+    const int64_t ne02 = rms_norm_src->ne[2];
+    const int64_t ne03 = rms_norm_src->ne[3];
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    const int mul_ncols     = mul_src->ne[0];
+    const int mul_nrows     = mul_src->ne[1];
+    const int mul_nchannels = mul_src->ne[2];
+    const int mul_nsamples  = mul_src->ne[3];
+
+    rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
+                          ne00, ne01, ne02, ne03,
+                          /*s00*/ s01, s02, s03,
+                          /*mul_s00*/ mul_s01, mul_s02, mul_s03,
+                          mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                          /*add_s00*/ 0, 0, 0,
+                          0, 0, 0, 0,
+                          eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                     ggml_tensor *               dst,
+                                     ggml_tensor *               mul_tensor,
+                                     ggml_tensor *               add_tensor) {
+    const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+    float               eps          = 0.0f;
+
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float *       src0_d  = (const float *) rms_norm_src->data;
+    const float *       mul_d   = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    if (mul_tensor->src[0] == dst) {
+        mul_d   = (float *) mul_tensor->src[1]->data;
+        mul_src = mul_tensor->src[1];
+    } else if (mul_tensor->src[1] == dst) {
+        mul_d   = (float *) mul_tensor->src[0]->data;
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    const float *       add_d   = nullptr;
+    const ggml_tensor * add_src = nullptr;
+
+    if (add_tensor->src[0] == mul_tensor) {
+        add_d   = (float *) add_tensor->src[1]->data;
+        add_src = add_tensor->src[1];
+    } else if (add_tensor->src[1] == mul_tensor) {
+        add_d   = (float *) add_tensor->src[0]->data;
+        add_src = add_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float *      dst_d  = (float *) add_tensor->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t ne00 = rms_norm_src->ne[0];
+    const int64_t ne01 = rms_norm_src->ne[1];
+    const int64_t ne02 = rms_norm_src->ne[2];
+    const int64_t ne03 = rms_norm_src->ne[3];
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    const int mul_ncols     = mul_src->ne[0];
+    const int mul_nrows     = mul_src->ne[1];
+    const int mul_nchannels = mul_src->ne[2];
+    const int mul_nsamples  = mul_src->ne[3];
+
+    const size_t ts_add = ggml_type_size(add_src->type);
+    GGML_ASSERT(add_src->nb[0] == ts_add);
+    const int64_t add_s01 = add_src->nb[1] / ts_add;
+    const int64_t add_s02 = add_src->nb[2] / ts_add;
+    const int64_t add_s03 = add_src->nb[3] / ts_add;
+
+    const int add_ncols     = add_src->ne[0];
+    const int add_nrows     = add_src->ne[1];
+    const int add_nchannels = add_src->ne[2];
+    const int add_nsamples  = add_src->ne[3];
+
+    rms_norm_mul_f32_cuda(src0_d, mul_d,add_d,dst_d,
+                          ne00,ne01, ne02, ne03,
+                          /*s00*/ s01, s02, s03,
+                          /*mul_s00*/ mul_s01, mul_s02, mul_s03,
+                          mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                          /*add_s00*/ add_s01, add_s02, add_s03,
+                          add_ncols, add_nrows, add_nchannels, add_nsamples,
+                          eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * grad  = dst->src[0]; // gradients
+    const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
+
+    const float * grad_d  = (const float *) grad->data;
+    const float * src0f_d = (const float *) src0f->data;
+    float       * dst_d   = (float       *) dst->data;
+
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous(grad));
+
+    GGML_ASSERT( grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0f->type == GGML_TYPE_F32);
+    GGML_ASSERT(  dst->type == GGML_TYPE_F32);
+
+    const int64_t ne00 = src0f->ne[0];
+    const int64_t nrows = ggml_nrows(src0f);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
+}
+
+void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// Gemma 4 MoE layer tail in one launch (one block per row, ncols <= 3*1024):
+//   mlp = rms_norm(x1)*w1 ; comb = rms_norm(x2)*w2 + mlp ; res = rms_norm(comb)*w3 + resid ; dst = res * layer_scalar
+// Same per-thread partial sums, same warp/block reduction (float2 reduce is component-wise identical) and same
+// expression forms (fused multiply-add where the unfused rms_norm+mul+add kernel contracts) as the 4 unfused kernels.
+template <int block_size, bool next_norm, bool quant>
+static __global__ void __launch_bounds__(block_size) tail_fused_f32(
+        const float * x1, const float * w1, const float * x2, const float * w2, const float * w3,
+        const float * resid, const float * lscale, float * dst, const float * w4, float * dst4, block_q8_1 * q8, const int ne0_pad,
+        const int ncols, const int64_t x1_stride, const int64_t x2_stride, const int64_t resid_stride, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float2 s_sum2[32];
+    __shared__ float  s_sum1[32];
+    __shared__ float  s_sum4[32];
+
+    ggml_cuda_pdl_sync();
+
+    const float * x1r = x1 + row*x1_stride;
+    const float * x2r = x2 + row*x2_stride;
+    const float * rr  = resid + row*resid_stride;
+    float *       dr  = dst + (int64_t) row*ncols;
+
+    float a[3], b[3];
+    float t1 = 0.0f, t2 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            a[k] = x1r[col];
+            b[k] = x2r[col];
+            t1 += a[k] * a[k];
+            t2 += b[k] * b[k];
+        }
+    }
+    const float2 r12 = block_reduce<block_reduce_method::SUM, block_size>(make_float2(t1, t2), s_sum2);
+    const float scale1 = rsqrtf(r12.x / ncols + eps);
+    const float scale2 = rsqrtf(r12.y / ncols + eps);
+
+    float c[3];
+    float o[3];
+    [[maybe_unused]] float y4[3];
+    float t3 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            const float mlp = __fmul_rn(__fmul_rn(scale1, a[k]), w1[col]);
+            c[k] = __fmaf_rn(__fmul_rn(scale2, b[k]), w2[col], mlp);
+            t3 += c[k] * c[k];
+        }
+    }
+    const float r3 = block_reduce<block_reduce_method::SUM, block_size>(t3, s_sum1);
+    const float scale3 = rsqrtf(r3 / ncols + eps);
+    const float ls = lscale[0];
+    float t4 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            const float res = __fmaf_rn(__fmul_rn(scale3, c[k]), w3[col], rr[col]);
+            o[k] = __fmul_rn(res, ls);
+            dr[col] = o[k];
+            if constexpr (next_norm) {
+                t4 += o[k] * o[k];
+            }
+        }
+    }
+    if constexpr (next_norm) {
+        // the next layer's attn_norm: rms_norm(l_out) * w4
+        const float r4 = block_reduce<block_reduce_method::SUM, block_size>(t4, s_sum4);
+        const float scale4 = rsqrtf(r4 / ncols + eps);
+        float * d4 = dst4 + (int64_t) row*ncols;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                y4[k] = __fmul_rn(__fmul_rn(scale4, o[k]), w4[col]);
+                d4[col] = y4[k];
+            }
+        }
+        if constexpr (quant) {
+            // the q8_1 activation quantize of the normalized row (ggml_cuda_mul_mat_vec_q's quantize_q8_1<AOS>,
+            // same expressions), padded to ne0_pad with zero blocks; one warp holds one 32-block (ncols % 32 == 0)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                const int col = tid + k*block_size;
+                if (col < ne0_pad) {
+                    const float xi = col < ncols ? y4[k] : 0.0f;
+                    float amax = fabsf(xi);
+                    float sum  = xi;
+                    amax = warp_reduce_max<QK8_1>(amax);
+                    sum  = warp_reduce_sum<QK8_1>(sum);
+                    const float  d = amax / 127.0f;
+                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                    const int64_t i_cont = (int64_t) row*ne0_pad + col;
+                    const int64_t ib  = i_cont / QK8_1;
+                    const int     iqs = i_cont % QK8_1;
+                    q8[ib].qs[iqs] = q;
+                    if (iqs == 0) {
+                        q8[ib].ds = make_half2(d, sum);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static __global__ void tail_verify_cmp_f32(const float * a, const float * b, const int64_t n, const int tag) {
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        if (__float_as_uint(a[i]) != __float_as_uint(b[i])) {
+            printf("TAILVERIFY MISMATCH tag=%d i=%lld ref=%.9g fused=%.9g\n", tag, (long long) i, a[i], b[i]);
+        }
+    }
+}
+
+// nodes: rms1, mul1, rms2, mul2, add2, rms3, mul3, add3, lscale_mul[, rms4, mul4 (next layer attn_norm) when n_fused == 11].
+// verify_scratch != nullptr: write there (verify_scratch2 for the attn_norm output) instead of the graph tensors.
+void ggml_cuda_op_tail_fused(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_fused,
+                             float * verify_scratch, float * verify_scratch2, block_q8_1 * q8, int ne0_pad) {
+    const ggml_tensor * rms1 = nodes[0]; const ggml_tensor * mul1 = nodes[1];
+    const ggml_tensor * rms2 = nodes[2]; const ggml_tensor * mul2 = nodes[3];
+    const ggml_tensor * rms3 = nodes[5]; const ggml_tensor * mul3 = nodes[6]; const ggml_tensor * add3 = nodes[7];
+    ggml_tensor * out = nodes[8];
+    const float * w1 = (const float *) (mul1->src[0] == rms1 ? mul1->src[1] : mul1->src[0])->data;
+    const float * w2 = (const float *) (mul2->src[0] == rms2 ? mul2->src[1] : mul2->src[0])->data;
+    const float * w3 = (const float *) (mul3->src[0] == rms3 ? mul3->src[1] : mul3->src[0])->data;
+    const ggml_tensor * resid_t = add3->src[0] == mul3 ? add3->src[1] : add3->src[0];
+    const ggml_tensor * ls_t    = out->src[0] == nodes[7] ? out->src[1] : out->src[0];
+    const float * w4 = nullptr;
+    float * dst4 = nullptr;
+    if (n_fused == 11) {
+        const ggml_tensor * mul4 = nodes[10];
+        w4   = (const float *) (mul4->src[0] == nodes[9] ? mul4->src[1] : mul4->src[0])->data;
+        dst4 = verify_scratch2 ? verify_scratch2 : (float *) mul4->data;
+    }
+    float eps;
+    memcpy(&eps, rms1->op_params, sizeof(float));
+    const int ncols = rms1->src[0]->ne[0];
+    const int nrows = rms1->src[0]->ne[1];
+    const dim3 blocks_num(nrows, 1, 1);
+    const dim3 block_dims(1024, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, 0, ctx.stream() };
+    float * dst = verify_scratch ? verify_scratch : (float *) out->data;
+    const int64_t s1 = rms1->src[0]->nb[1] / sizeof(float);
+    const int64_t s2 = rms2->src[0]->nb[1] / sizeof(float);
+    const int64_t sr = resid_t->nb[1] / sizeof(float);
+    if (n_fused == 11 && q8) {
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, true, true>, launch_params,
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+    } else if (n_fused == 11) {
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, true, false>, launch_params,
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+    } else {
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, false, false>, launch_params,
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+    }
+}
+
+void ggml_cuda_op_tail_verify_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * out, const float * scratch, int tag) {
+    tail_verify_cmp_f32<<<8, 256, 0, ctx.stream()>>>((const float *) out->data, scratch, ggml_nelements(out), tag);
+}
+
+static __global__ void tail_verify_cmp_words(const int * a, const int * b, const int64_t n, const int tag) {
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        if (a[i] != b[i]) {
+            printf("TAILVERIFY MISMATCH q8 tag=%d word=%lld ref=%08x fused=%08x\n", tag, (long long) i, (unsigned) a[i], (unsigned) b[i]);
+        }
+    }
+}
+
+void ggml_cuda_op_tail_verify_cmp_q8(ggml_backend_cuda_context & ctx, const void * ref, const void * fused, size_t nbytes, int tag) {
+    tail_verify_cmp_words<<<8, 256, 0, ctx.stream()>>>((const int *) ref, (const int *) fused, (int64_t) (nbytes/4), tag);
+}
