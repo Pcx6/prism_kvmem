@@ -2909,6 +2909,13 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.task &&
+                    slot.task->should_stop && slot.task->should_stop()) {
+                SLT_INF(slot, "client disconnected, releasing slot (n_tokens = %d)\n", slot.prompt.n_tokens());
+                slot.release();
+                return;
+            }
+
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
@@ -4414,6 +4421,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
+
+            // a client that disconnects should stop the work it asked for
+            task.should_stop = req.should_stop;
 
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(

@@ -164,6 +164,9 @@ struct server_task {
     std::string             cli_prompt;
     std::vector<raw_buffer> cli_files;
 
+    // true once the client connection behind this task is gone
+    std::function<bool()> should_stop;
+
     server_task_type type;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
