@@ -255,7 +255,28 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader   # 期望 9-10 GB
 
 生成 2 秒后断开：服务端在 `n_tokens=185-251` 处停止（max_tokens=5000），GPU 利用率 98% 在 0.4 秒内回落到 0%，下一次请求正常；连续 3 次中断无 hole。
 
-### 6.7 长文检索质量
+### 6.7 KV 留存、TTL 与内存回收（2026-11-07 新增）
+
+- 参数：`--kvmem-idle-ttl SECONDS`（默认 86400，0 = 永不清理；env `LLAMA_ARG_KVMEM_IDLE_TTL`），生产脚本已加 `--kvmem-idle-ttl 86400`。
+- 实现：队列空闲 tick 每约 1 秒触发一次扫描（不依赖 prompt cache）；只清理 `state == IDLE` 的 slot；执行 `prompt_clear()`（KVMem full reset，释放 host raw/块）+ `malloc_trim(0)` 归还内存。
+- 日志：`KVMEM_IDLE_EVICT reason=idle_ttl idle_ms=... n_tokens=...`
+- 实测（14805 独立实例）：
+
+| 场景 | 请求后 RSS | TTL 清理后 RSS | 释放 | 触发 |
+|---|---|---|---|---|
+| 64K，TTL=5 s | 5.63 GB | 1.27 GB | 4.36 GB | idle_ms=5001 |
+| 250K，TTL=10 s | 17.96 GB | 1.33 GB | 16.6 GB | idle_ms=10002 |
+| 小请求（84 token） | - | - | - | idle_ms=5001 |
+| TTL=0（禁用） | 不变 | 不变 | 0 | 8 s 内 0 次 evict |
+| TTL=86400 + 8 轮 Agent | - | - | 0 | 23.2 s，前缀复用正常 |
+
+说明：GPU KV 池是启动时固定分配（约 2.1-2.2 GB），清理释放的是池内行和主机内存，不会把这块显存归还给驱动；显存占用仍稳定在 9.4-10.8 GB。
+
+OOM 兜底（同一提交）：
+- 空闲 tick 检查 `MemAvailable < 1.5 GB` 或 GPU free < 1 GB 时，强制清理所有 IDLE slot 的 KV（`reason=oom_guard`）。
+- decode 抛分配异常时，清理 IDLE KV 并重试同一 batch 一次（`reason=oom_retry`），仍失败才报错。
+
+### 6.8 长文检索质量
 
 100K 文档（开头埋 `ORANGE-FALCON-42`）：检索版正确命中；`--kvmem-method recency` 或去掉 `apply_retrieval` 都答错，证明 span+检索生效。
 
@@ -362,6 +383,8 @@ f1e1646 fix: disable native prompt cache and checkpoints under KVMem
 703d34d docs : add the KVMem x prism production README and repro scripts
 ba7fde1 docs : document the prompt cache / checkpoint incompatibility
 f33e68a docs : document client disconnect cancellation
+5bee96e docs : add final context-size, TTFT and warm-cache benchmarks
+bdd446f server : add KVMem idle TTL eviction and memory pressure guard
 ```
 
 
@@ -424,3 +447,4 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 | 中断取消 | 2 s 断开后 0.4 s 内 GPU 98% -> 0%，slot 立即释放 |
 | 稳定性 | 修复后 0 `hole`、0 `Context size exceeded`、0 `prepare_reject` |
 | 长期运行 | 单卡 16 GB，显存峰值 10.8 GB，余量 5 GB+ |
+| KV 空闲回收 | TTL 到期后 250K 会话 RSS 17.96 GB -> 1.33 GB（释放 16.6 GB）；TTL=0 可禁用 |
