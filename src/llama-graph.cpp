@@ -2820,6 +2820,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
+#if defined(LLAMA_KVMEM)
+        if (arch != LLM_ARCH_DFLASH)
+            llama_kvmem_capture_attention(ctx0, gf, q, k, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.f, il);
+#endif
+
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
@@ -2847,6 +2853,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+#if defined(LLAMA_KVMEM)
+        if (arch != LLM_ARCH_DFLASH)
+            llama_kvmem_capture_attention(ctx0, gf, q, k, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.f, il);
+#endif
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
