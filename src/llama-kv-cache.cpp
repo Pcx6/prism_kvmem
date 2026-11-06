@@ -1185,16 +1185,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d()) {
-                llama_kv_cell_ext ext {
-                    /*.x =*/ ubatch.pos[i + ubatch.n_tokens*2],
-                    /*.y =*/ ubatch.pos[i + ubatch.n_tokens],
-                };
-                ext.logical_pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
-                cells.ext_set(idx, ext);
-            } else if (ubatch.logical_pos) {
+            // every written cell carries its logical position; the KVMem adapter compares it
+            // against the row it re-stages, so the 2D and logical_pos cases alone are not enough
+            if (ubatch.is_pos_2d() || ubatch.token || ubatch.logical_pos) {
                 llama_kv_cell_ext ext;
-                ext.logical_pos = ubatch.logical_pos[i];
+                ext.logical_pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
+
+                if (ubatch.is_pos_2d()) {
+                    ext.x = ubatch.pos[i + ubatch.n_tokens*2];
+                    ext.y = ubatch.pos[i + ubatch.n_tokens];
+                }
+
                 cells.ext_set(idx, ext);
             }
 
