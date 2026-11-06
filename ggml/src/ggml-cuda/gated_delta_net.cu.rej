@@ -1,0 +1,44 @@
+diff a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu	(rejected hunks)
+@@ -1,4 +1,5 @@
+ #include "gated_delta_net.cuh"
++#include "ggml-cuda.h"
+ #include "ggml-cuda/common.cuh"
+ 
+ template <int S_v, bool KDA, bool keep_rs_t>
+@@ -43,7 +44,9 @@ gated_delta_net_cuda(const float * q,
+     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
+     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+-    state += state_out_offset;
++    if (K > 0) {
++        state += state_out_offset;
++    }
+     curr_state += state_in_offset + col * S_v;
+     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+ 
+@@ -84,23 +87,14 @@ gated_delta_net_cuda(const float * q,
+         if constexpr (!KDA) {
+             const float g_val = expf(*g_t);
+ 
+-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+-            float kv_shard = 0.0f;
+-#pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                kv_shard += s_shard[r] * k_reg[r];
+-            }
+-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+-
+-            // delta[col] = (v[col] - g * kv[col]) * beta
+-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
++            const float delta_col = gdn_delta_f32<rows_per_lane, warp_size>(s_shard, k_reg, g_val, v_t[col], beta_val);
+ 
+             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+             float attn_partial = 0.0f;
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
++                s_shard[r]  = gdn_update_f32(s_shard[r], k_reg[r], g_val, delta_col);
+                 attn_partial += s_shard[r] * q_reg[r];
+             }
+ 

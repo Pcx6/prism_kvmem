@@ -2109,6 +2109,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_solve_tri(params, tensor);
             } break;
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_RECORD:
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
