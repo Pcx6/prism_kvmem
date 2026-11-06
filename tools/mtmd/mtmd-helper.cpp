@@ -115,12 +115,13 @@ private:
 };
 
 // Helper function for decoding an image whose embeddings have already been calculated
-int32_t mtmd_helper_decode_image_chunk_with_decoder(
+static int32_t decode_image_chunk_impl(
         mtmd_context * ctx,
         struct llama_context * lctx,
         const mtmd_input_chunk * chunk,
         float * encoded_embd,
         llama_pos n_past,
+        llama_pos row_0,
         llama_seq_id seq_id,
         int32_t n_batch,
         llama_pos * new_n_past,
@@ -153,7 +154,7 @@ int32_t mtmd_helper_decode_image_chunk_with_decoder(
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
             std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
             mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
-            batch_embd.set_position_mrope_2d(rel_pos, seq_id, n_past);
+            batch_embd.set_position_mrope_2d(rel_pos, seq_id, row_0);
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
         } else {
@@ -199,12 +200,30 @@ int32_t mtmd_helper_decode_image_chunk_with_decoder(
     return 0;
 }
 
+int32_t mtmd_helper_decode_image_chunk_with_decoder(
+        mtmd_context * ctx, llama_context * lctx, const mtmd_input_chunk * chunk,
+        float * encoded_embd, llama_pos n_past, llama_seq_id seq_id, int32_t n_batch,
+        llama_pos * new_n_past, mtmd_helper_post_decode_callback callback,
+        void * user_data, mtmd_helper_decode_callback decoder) {
+    return decode_image_chunk_impl(ctx, lctx, chunk, encoded_embd,
+            n_past, n_past, seq_id, n_batch, new_n_past, callback, user_data, decoder);
+}
+
 int32_t mtmd_helper_decode_image_chunk(
         mtmd_context * ctx, llama_context * lctx, const mtmd_input_chunk * chunk,
         float * encoded_embd, llama_pos n_past, llama_seq_id seq_id, int32_t n_batch,
         llama_pos * new_n_past, mtmd_helper_post_decode_callback callback, void * user_data) {
-    return mtmd_helper_decode_image_chunk_with_decoder(ctx, lctx, chunk, encoded_embd,
-            n_past, seq_id, n_batch, new_n_past, callback, user_data, nullptr);
+    return decode_image_chunk_impl(ctx, lctx, chunk, encoded_embd,
+            n_past, n_past, seq_id, n_batch, new_n_past, callback, user_data, nullptr);
+}
+
+int32_t mtmd_helper_decode_image_chunk_rows(
+        mtmd_context * ctx, llama_context * lctx, const mtmd_input_chunk * chunk,
+        float * encoded_embd, llama_pos n_past, llama_pos row_0, llama_seq_id seq_id,
+        int32_t n_batch, llama_pos * new_n_past,
+        mtmd_helper_post_decode_callback callback, void * user_data) {
+    return decode_image_chunk_impl(ctx, lctx, chunk, encoded_embd,
+            n_past, row_0, seq_id, n_batch, new_n_past, callback, user_data, nullptr);
 }
 
 int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,

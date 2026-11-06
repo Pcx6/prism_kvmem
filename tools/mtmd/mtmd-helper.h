@@ -108,6 +108,20 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
                                                 mtmd_helper_post_decode_callback callback,
                                                 void * user_data);
 
+// Same as above, but the caller also supplies the first cache row for KV memories that
+// index rows separately from M-RoPE positions (0 for the first image, image token count after).
+MTMD_API int32_t mtmd_helper_decode_image_chunk_rows(mtmd_context * ctx,
+                                                struct llama_context * lctx,
+                                                const mtmd_input_chunk * chunk,
+                                                float * encoded_embd,
+                                                llama_pos n_past,
+                                                llama_pos row_0,
+                                                llama_seq_id seq_id,
+                                                int32_t n_batch,
+                                                llama_pos * new_n_past,
+                                                mtmd_helper_post_decode_callback callback,
+                                                void * user_data);
+
 // Alternate decode dispatch; preserves native batching, positions and attention setup.
 typedef int32_t (*mtmd_helper_decode_callback)(struct llama_context * lctx, struct llama_batch batch, void * user_data);
 MTMD_API int32_t mtmd_helper_decode_image_chunk_with_decoder(

@@ -75,10 +75,12 @@ struct server_batch {
         int32_t id_slot;
         llama_token token;
         llama_pos pos;
+        llama_pos logical; // cache row, independent of M-RoPE positions
         bool output;
         bool is_prompt; // for stats tracking
     };
     std::vector<token> tokens;
+    std::vector<llama_pos> logical_pos;
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
 
@@ -112,22 +114,22 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt, llama_pos logical = -1) {
         GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output, is_prompt });
+        tokens.push_back({ id_slot, token, pos, logical, output, is_prompt });
         return true;
     }
 
-    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt, llama_pos logical = -1) {
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
+        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, logical, output, is_prompt });
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -142,6 +144,8 @@ struct server_batch {
         alora_disabled_id = 0;
         batch_rendered    = false;
         has_embd          = false;
+        logical_pos.clear();
+        batch.logical_pos = nullptr;
         if (batch.token == nullptr) {
             batch.token = tokens_ptr;
             batch.embd  = nullptr;
@@ -161,10 +165,13 @@ struct server_batch {
         GGML_ASSERT(!batch_rendered);
         GGML_ASSERT(batch.pos != nullptr);
         common_batch_clear(batch);
+        logical_pos.resize(size());
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
+            logical_pos[i] = t.logical >= 0 ? t.logical : t.pos;
             common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
         }
+        batch.logical_pos = logical_pos.empty() ? nullptr : logical_pos.data();
         if (has_embd) {
             batch.token = nullptr; // will be restored on clear()
             batch.embd  = embd.data();
@@ -189,6 +196,8 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
+            batch.logical_pos ? batch.logical_pos + off : nullptr,
+            nullptr,
         };
 
         return view;
@@ -483,9 +492,9 @@ struct server_slot {
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false, (llama_pos) prompt.n_tokens());
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false, (llama_pos) prompt.n_tokens());
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -503,9 +512,10 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
+            llama_pos row0 = (llama_pos) prompt.n_tokens();
+            add_ok &= batch.add(id, sampled, pos0++, true, false, row0);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+                add_ok &= batch.add(this->id, token, pos0++, true, false, ++row0);
             }
         }
 
@@ -734,12 +744,13 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
-                res = mtmd_helper_decode_image_chunk(
+                res = mtmd_helper_decode_image_chunk_rows(
                     mctx,
                     slot.ctx_tgt,
                     chunk.get(),
                     embd,
                     slot.prompt.tokens.pos_next(),
+                    (llama_pos) slot.prompt.n_tokens(),
                     slot.id,
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
@@ -751,6 +762,10 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     return -1;
                 }
                 n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+                SLT_INF(slot, "KVMEM_MTMD idx=%zu n_tokens=%u n_pos=%d pos_next=%d rows=%zu\n",
+                        idx, n_tokens_out,
+                        (int) mtmd_input_chunk_get_n_pos(chunk.get()),
+                        slot.prompt.tokens.pos_next(), slot.prompt.tokens.size());
                 return 0; // success
             }
         }
@@ -3544,7 +3559,8 @@ private:
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                            /* is_prompt = */ true,
+                            /* logical   = */ (llama_pos) slot.prompt.n_tokens());
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
