@@ -3851,9 +3851,13 @@ private:
                 // selected history back into GPU, then start generation over that view.
                 // Short requests stayed fully resident and skipped capture, so there is
                 // nothing to score or stage.
-                if (!slot.kvmem_short_bypass) {
+                if (!slot.kvmem_short_bypass && llama_kvmem_get_params()->enabled) {
                     try {
-                        const auto & prompt_tokens = slot.prompt.tokens.get_tokens();
+                        const size_t n_prompt = slot.prompt.tokens.size();
+                        std::vector<llama_token> prompt_tokens(n_prompt);
+                        for (size_t i = 0; i < n_prompt; i++) {
+                            prompt_tokens[i] = slot.prompt.tokens[i];
+                        }
                         llama_kvmem_end_prefill_capture();
                         llama_kvmem_apply_retrieval(ctx_tgt);
                         llama_kvmem_pin_working_set();
