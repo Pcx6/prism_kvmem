@@ -189,36 +189,75 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader   # 期望 9-10 GB
 跨阈值场景（8K -> 40K -> 8K）：8.9 s -> 63.1 s（`KVMEM_BYPASS_EXIT` 整体重算）-> 9.3 s，行为正常。
 
 
-## 6. 实测数据
+## 6. 极限上下文实测（收口）
 
-### 6.1 长文（生产同配置）
+测试时间 2026-11-06，生产 14803（KVMem 池 34816 + 视觉 + API 名 Bonsai-2-27B），全部经 14802 代理，V100 16 GB。
 
-| 请求 | prefill | decode | 峰值 |
-|---|---|---|---|
-| 128K（117,789 token） | 573.2 t/s | 52.5 t/s | 8929 MiB |
-| 256K（255,607 token） | 542.8 t/s | 47.5 t/s | 9337 MiB |
-| 100K 检索质量 | 591.9 t/s | 56.9 t/s | - |
+### 6.1 测试方法
 
-100K 文档（开头埋 `ORANGE-FALCON-42`）：检索版正确命中；`--kvmem-method recency` 或去掉 `apply_retrieval` 都答错，证明 span+检索生效。
+- 每个尺寸独立冷请求：`cache_prompt: false`、`max_tokens: 32`、`temperature: 0`，避免前缀缓存互相影响。
+- 指标：prompt_n（实际 prefill token 数）、prefill t/s、TTFT（服务端 prompt_ms）、decode t/s、wall、显存峰值（1.5 s 采样）。
+- 热缓存测试：先冷跑一次长 prompt，再在同一 prompt 尾部追加一句短问题（`cache_prompt: true`），只计算新增 token。
 
-### 6.2 短请求与 Agent
+### 6.2 冷上下文渐进（8K 到 250K）
+
+| 目标 | prompt_n | prefill t/s | TTFT | decode t/s | wall | 显存峰值 |
+|---|---|---|---|---|---|---|
+| 8K | 8,244 | 825.2 | 9.99 s | 57.8 | 10.6 s | 10733 MiB |
+| 16K | 16,436 | 795.4 | 20.66 s | 53.9 | 21.4 s | 10693 MiB |
+| 24K | 24,628 | 742.8 | 33.16 s | 50.3 | 34.0 s | 10733 MiB |
+| 32K | 32,820 | 679.9 | 48.28 s | 47.0 | 49.3 s | 10693 MiB |
+| 40K | 41,012 | 648.8 | 63.22 s | 54.0 | 64.2 s | 10733 MiB |
+| 48K | 49,204 | 621.7 | 79.14 s | 54.0 | 80.2 s | 10733 MiB |
+| 64K | 65,588 | 602.0 | 108.95 s | 53.9 | 110.2 s | 10741 MiB |
+| 96K | 98,356 | 578.9 | 169.91 s | 53.8 | 171.5 s | 10781 MiB |
+| 128K | 131,124 | 564.1 | 232.44 s | 54.3 | 234.4 s | 10703 MiB |
+| 192K | 196,660 | 553.1 | 355.57 s | 53.4 | 358.3 s | 10781 MiB |
+| **250K** | **250,053** | **546.0** | **457.93 s** | 52.7 | 461.2 s | 10781 MiB |
+
+曲线特征：
+
+- TTFT 近似线性：8K 为 1.21 ms/token，250K 为 1.83 ms/token；250K 冷启动约 7.6 分钟。
+- prefill 从 825 t/s 降到 546 t/s（-34%）；32K 及以下走短路（680-825 t/s），33K 以上进入 KVMem 换页（546-649 t/s），**没有断崖**。
+- decode 全程 47-58 t/s，与上下文长度基本无关。
+- 显存峰值 10.7-10.8 GB，不随长度增长；250K（接近 262144 上限）无 OOM、无 hole。
+- 250K 冷启动复测 548.6 t/s / TTFT 455.8 s，与上表一致。
+
+### 6.3 热缓存长上下文 TTFT（同一长对话第二轮）
+
+| 上下文 | cache_n | 新增 token | TTFT | wall |
+|---|---|---|---|---|
+| 128K | 131,117 | 13 | **1.79 s** | 3.89 s |
+| 192K | 196,653 | 13 | **2.56 s** | 5.36 s |
+| 250K | 250,046 | 13 | **3.19 s** | 6.58 s |
+
+第二轮只计算 13 个新 token，TTFT 1.8-3.2 s（含 KVMem 截断/检索固定开销），相比冷启动的 231-456 s，这是长对话可用的关键指标。
+
+### 6.4 Agent 8 轮（短请求 + 上下文增长）
 
 | 场景 | 结果 |
 |---|---|
-| 32K 冷请求（短路） | 689.6 t/s，wall 47.2 s |
-| 8 轮 Agent（原生产 14803） | 24.6 s / TTFT 16.3 s |
-| 8 轮 Agent（融合 + 短路） | 23.1-24.4 s / TTFT 13.6-14.1 s |
-| 原生 prism 基线（128K prefill） | 546-559 t/s |
+| 原生产 14803（原生 prism） | 24.6 s / TTFT 16.3 s |
+| 融合 + 短路（当前生产） | 23.1-24.4 s / TTFT 13.6-14.1 s |
+| 单轮 prompt 约 1.5K | prefill 750-900 t/s，TTFT 1.1-2.0 s |
 
-### 6.3 视觉
+### 6.5 视觉
 
 | 图片 | prompt | TTFT | wall | 结果 |
 |---|---|---|---|---|
-| 简谱 PNG | 1986 | 3.65 s | 28.6 s | 歌词/标题/调号基本逐字正确 |
+| 简谱 PNG | 1,986 | 3.65 s | 28.6 s | 歌词/标题/调号基本逐字正确 |
 | 简谱 JPG | 344 | 0.69 s | 12.1 s | 歌词整段正确 |
-| 风景照片 | 2059 | 3.55 s | 30.9 s | 描述详实，无幻觉 |
+| 风景照片 | 2,059 | 3.55 s | 30.9 s | 描述详实，无幻觉 |
 
 未观察到 V100 典型的整行乱码；视觉默认走 GPU（`--no-mmproj-offload` 可切 CPU，慢约 2 倍，作降级方案）。
+
+### 6.6 中断取消
+
+生成 2 秒后断开：服务端在 `n_tokens=185-251` 处停止（max_tokens=5000），GPU 利用率 98% 在 0.4 秒内回落到 0%，下一次请求正常；连续 3 次中断无 hole。
+
+### 6.7 长文检索质量
+
+100K 文档（开头埋 `ORANGE-FALCON-42`）：检索版正确命中；`--kvmem-method recency` 或去掉 `apply_retrieval` 都答错，证明 span+检索生效。
 
 
 ## 7. 已知限制
@@ -318,6 +357,11 @@ f297fd8 graph : capture attention operands for KVMem sampling
 4232755 mtmd : give image embedding batches monotonic cache rows
 50b9f3f server : skip KVMem prefill hooks when the memory is disabled
 96b6d89 fix: resolve completion hole error caused by KVMem logical_pos discontinuity
+f1e1646 fix: disable native prompt cache and checkpoints under KVMem
+9cfb691 server : stop generation when the client disconnects
+703d34d docs : add the KVMem x prism production README and repro scripts
+ba7fde1 docs : document the prompt cache / checkpoint incompatibility
+f33e68a docs : document client disconnect cancellation
 ```
 
 
@@ -364,3 +408,19 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 2. 多模态长对话（超过 33K）目前会退回 KVMem 换页，可观察图像后持续的文本轮次质量。
 3. 16 GB 单卡无法双实例，灰度验证建议准备第二块 GPU 或安排维护窗口做全量切换。
 4. 视觉若遇到 V100 精度问题，启动加 `--no-mmproj-offload`，并对比同一图片的 OCR 结果。
+
+
+## 13. 验收结论（2026-11-06 收口）
+
+| 目标 | 结果 |
+|---|---|
+| KVMem + Prism 融合 | 生产 14803 单实例运行，启动 9395 MiB（含视觉） |
+| 超长 250K | prefill 546-549 t/s，TTFT 456-458 s，无 OOM / 无 hole |
+| 128K | prefill 564-568 t/s，TTFT 231-232 s |
+| 常用 16K / 32K / 64K | 795 / 680 / 602 t/s，TTFT 20.7 / 48.3 / 109.0 s |
+| 热缓存长上下文 | 128K/192K/250K 第二轮 TTFT 1.79 / 2.56 / 3.19 s |
+| 8 轮 Agent | 23.1-24.4 s，总 TTFT 13.6-14.1 s |
+| 多模态 | OCR 与图片描述正确，TTFT 0.93-3.65 s |
+| 中断取消 | 2 s 断开后 0.4 s 内 GPU 98% -> 0%，slot 立即释放 |
+| 稳定性 | 修复后 0 `hole`、0 `Context size exceeded`、0 `prepare_reject` |
+| 长期运行 | 单卡 16 GB，显存峰值 10.8 GB，余量 5 GB+ |
