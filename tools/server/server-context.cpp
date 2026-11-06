@@ -11,6 +11,9 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1759,6 +1762,19 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+#if defined(LLAMA_KVMEM)
+        // KVMem selection state is process-wide; set it on the loop thread right before this
+        // request is decoded so a request queued in the background cannot overwrite it.
+        llama_kvmem_set_request_span(
+                slot.task->params.kvmem_qbegin,
+                slot.task->params.kvmem_qend,
+                slot.task->params.kvmem_force);
+        if (slot.task->params.kvmem_qbegin >= 0) {
+            SLT_INF(slot, "KVMEM_REQUEST_SPAN begin=%d end=%d n_tokens=%d\n",
+                    slot.task->params.kvmem_qbegin, slot.task->params.kvmem_qend, slot.task->n_tokens());
+        }
+#endif
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -4183,6 +4199,45 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+#if defined(LLAMA_KVMEM)
+// KVMem scores cached blocks against the request question. Recover the last user message text
+// before the chat template erases the message boundaries; the token span is computed later,
+// where the prompt tokens are known.
+static std::string kvmem_last_user_text(const json & body) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        return {};
+    }
+
+    const auto & messages = body.at("messages");
+    for (size_t i = messages.size(); i-- > 0;) {
+        const auto & msg = messages.at(i);
+        if (!msg.is_object() || msg.value("role", std::string()) != "user") {
+            continue;
+        }
+        if (!msg.contains("content")) {
+            return {};
+        }
+
+        const auto & content = msg.at("content");
+        if (content.is_string()) {
+            return content.get<std::string>();
+        }
+
+        std::string text;
+        if (content.is_array()) {
+            for (const auto & part : content) {
+                if (part.is_object() && part.value("type", std::string()) == "text") {
+                    text += part.value("text", std::string());
+                }
+            }
+        }
+        return text;
+    }
+
+    return {};
+}
+#endif
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4248,6 +4303,26 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+#if defined(LLAMA_KVMEM)
+            // Question span: the last user message inside the rendered prompt, in prompt-token
+            // positions. Prefix tokenization matches the full prompt tokenization used above.
+            if (data.contains("kvmem_user_text") && data.at("prompt").is_string()) {
+                const std::string ptext = data.at("prompt").get<std::string>();
+                const std::string utext = data.at("kvmem_user_text").get<std::string>();
+                const size_t pos = ptext.rfind(utext);
+                if (pos != std::string::npos) {
+                    const auto tokens_pre  = common_tokenize(ctx_server.vocab, ptext.substr(0, pos), true, true);
+                    const auto tokens_thru = common_tokenize(ctx_server.vocab, ptext.substr(0, pos + utext.size()), true, true);
+                    task.params.kvmem_qbegin = (int32_t) tokens_pre.size();
+                    task.params.kvmem_qend   = (int32_t) std::min<size_t>(tokens_thru.size(), task.tokens.size());
+                    if (task.params.kvmem_qend <= task.params.kvmem_qbegin) {
+                        task.params.kvmem_qbegin = -1;
+                        task.params.kvmem_qend   = -1;
+                    }
+                }
+            }
+#endif
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -4864,6 +4939,14 @@ void server_routes::init_routes() {
             body,
             meta->chat_params,
             files);
+#if defined(LLAMA_KVMEM)
+        if (llama_kvmem_get_params()->enabled) {
+            const std::string user_text = kvmem_last_user_text(body);
+            if (!user_text.empty() && body_parsed.contains("prompt") && body_parsed.at("prompt").is_string()) {
+                body_parsed["kvmem_user_text"] = user_text;
+            }
+        }
+#endif
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
