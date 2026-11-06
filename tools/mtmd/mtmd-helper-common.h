@@ -75,6 +75,7 @@ struct decode_embd_batch {
     int n_mmproj_embd;
     std::vector<llama_pos>      pos;
     std::vector<llama_pos>      pos_view; // used by mrope
+    std::vector<llama_pos>      logical;  // monotonic cache rows, independent of M-RoPE
     std::vector<int32_t>        n_seq_id;
     std::vector<llama_seq_id>   seq_id_0;
     std::vector<llama_seq_id *> seq_ids;
@@ -83,6 +84,7 @@ struct decode_embd_batch {
     decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
         GGML_ASSERT(n_tokens > 0 && n_pos_per_embd > 0 && n_mmproj_embd > 0);
         pos     .resize((size_t) n_tokens * (size_t) n_pos_per_embd);
+        logical .resize((size_t) n_tokens);
         n_seq_id.resize(n_tokens);
         seq_ids .resize(n_tokens + 1);
         logits  .resize(n_tokens);
@@ -96,6 +98,8 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ n_seq_id.data(),
             /*seq_id         =*/ seq_ids.data(),
             /*logits         =*/ logits.data(),
+            /*logical_pos    =*/ logical.data(),
+            /*embd_nextn     =*/ nullptr,
         };
     }
 
@@ -106,11 +110,12 @@ struct decode_embd_batch {
             batch.n_seq_id[i] = 1;
             batch.seq_id  [i] = seq_id_0.data();
             batch.logits  [i] = false;
+            logical       [i] = pos_0 + i;
         }
     }
 
     // M-RoPE for image
-    void set_position_mrope_2d(const std::vector<mtmd_decoder_pos> & rel_pos, llama_seq_id seq_id) {
+    void set_position_mrope_2d(const std::vector<mtmd_decoder_pos> & rel_pos, llama_seq_id seq_id, llama_pos logical_0) {
         GGML_ASSERT(n_pos_per_embd == 4);
         GGML_ASSERT(!rel_pos.empty() && (int32_t)rel_pos.size() == batch.n_tokens);
         seq_id_0[0] = seq_id;
@@ -121,6 +126,7 @@ struct decode_embd_batch {
             pos[idx + n_tokens         ] = rel_pos[i].y;
             pos[idx + n_tokens * 2     ] = rel_pos[i].x;
             pos[idx + n_tokens * 3     ] = rel_pos[i].z;
+            logical[i] = logical_0 + i;
         }
         for (int i = 0; i < batch.n_tokens; i++) {
             batch.n_seq_id[i] = 1;
@@ -140,6 +146,7 @@ struct decode_embd_batch {
             pos[idx + n_tokens         ] = pos_0 + i;
             pos[idx + n_tokens * 2     ] = pos_0 + i;
             pos[idx + n_tokens * 3     ] = pos_0 + i;
+            logical[i] = pos_0 + i;
         }
         for (int i = 0; i < batch.n_tokens; i++) {
             batch.n_seq_id[i] = 1;
@@ -179,6 +186,8 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ batch.n_seq_id + offset,
             /*seq_id         =*/ batch.seq_id   + offset,
             /*logits         =*/ batch.logits   + offset,
+            /*logical_pos    =*/ logical.data() + offset,
+            /*embd_nextn     =*/ nullptr,
         };
     }
 };

@@ -153,7 +153,7 @@ int32_t mtmd_helper_decode_image_chunk_with_decoder(
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
             std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
             mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
-            batch_embd.set_position_mrope_2d(rel_pos, seq_id);
+            batch_embd.set_position_mrope_2d(rel_pos, seq_id, n_past);
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
         } else {
