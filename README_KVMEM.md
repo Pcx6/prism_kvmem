@@ -256,7 +256,16 @@ CPU page softmax 在 25 万 token 上跑 >10 分钟。启用 `KVMEM_PAGE_SOFTMAX
 
 KVMem 的 `seq_pos_min` 返回原生行位置，触发 Prism 的 checkpoint 回退分支把 `n_past` 清 0。已对 KVMem 加守卫并补 `begin_cached_turn/truncate_cached`，`cache_n` 恢复正常。
 
-### 8.5 其他
+### 8.5 纯文本请求报 Context size exceeded / leaves a hole
+
+- 现象：短文本请求偶发 `Context size exceeded`，随后同一会话连续 `completion leaves a hole`；重启后恢复。
+- 根因：server 自带的 RAM prompt cache（`--cache-ram`，默认 8192 MiB）和原生 context checkpoint 会保存/恢复**原生 KV 状态**；KVMem 的 store 不在其中，恢复后 token 数、行号和 store 行数分叉（实测恢复后 prompt 16411 token，store 只有 15879 行），KVMem 准备 batch 失败 → 重试到 1 token → Context exceeded → 完成围栏报 hole。
+- 修复（`f1e1646`）：
+  - KVMem 启用时强制关闭 RAM prompt cache 与原生 checkpoint（server 内守卫），启动脚本加 `--cache-ram 0 -ctxcp 0`；
+  - 前缀截断在位置删除之后追加 `llama_kvmem_remove_logical` 行级清除，避免媒体行残留。
+- 复现：8K 文本 + 图片 + 8K 文本，随后多次更短前缀复用，3 轮即触发；修复后 12/12 请求通过。
+
+### 8.6 其他
 
 - 服务器偶发忽略 SIGTERM，`kill` 无效时用 `kill -9`。
 - 用 `pkill -f 'trim_proxy.mjs'` 会匹配到执行命令本身，建议按端口/进程号精确杀。
