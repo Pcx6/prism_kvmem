@@ -1,6 +1,6 @@
 # KVMem x Prism 文档
 
-完整说明见仓库根目录 [README_KVMEM.md](../../README_KVMEM.md)。
+完整说明见仓库根目录 [README.md](../../README.md)。
 
 本目录只放可复现脚本：
 
