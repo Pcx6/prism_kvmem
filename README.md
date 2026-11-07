@@ -494,32 +494,32 @@ KVMem 的 `seq_pos_min` 返回原生行位置，触发 Prism 的 checkpoint 回�
 主要提交（由旧到新）：
 
 ```
-725b9b4 llama : add name_tag to llama_kv_cache ctor
-e24af54 llama : add the PLE conv plane to llama_memory_recurrent
-3519f65 ggml : give ggml_backend_cuda_gdn_fold model-defined head counts
-ae03f78 llama : write logical_pos for every applied KV cell
-e0616f6 qwen35 : capture pre-RoPE Q and K for KVMem
-a7d2446 common : add --kvmem options and set KVMem params before context init
-6adec20 build : compile the KVMem attention sources
-533ccdb build : shim the ggml precision setter for the KVMem adapter
-513eb02 common : find kvmem headers and match the KVMem defaults
-f297fd8 graph : capture attention operands for KVMem sampling
-77760d0 server : restore prism oaicompat chat parse
-5e7843a server : inject the KVMem question span before decoding a request
-937def2 server : inject the KVMem question span, apply retrieval after prefill, keep prefix reuse
-5e857a2 build : enable the CUDA page-softmax retrieval scorer
-80cbe23 server : bypass KVMem capture and staging while the request fits the GPU pool
-0048ed8 server : bound the short-context bypass by the pool high watermark
-4232755 mtmd : give image embedding batches monotonic cache rows
-50b9f3f server : skip KVMem prefill hooks when the memory is disabled
-96b6d89 fix: resolve completion hole error caused by KVMem logical_pos discontinuity
-f1e1646 fix: disable native prompt cache and checkpoints under KVMem
-9cfb691 server : stop generation when the client disconnects
-703d34d docs : add the KVMem x prism production README and repro scripts
-ba7fde1 docs : document the prompt cache / checkpoint incompatibility
-f33e68a docs : document client disconnect cancellation
-5bee96e docs : add final context-size, TTFT and warm-cache benchmarks
-bdd446f server : add KVMem idle TTL eviction and memory pressure guard
+035b2dc llama : add name_tag to llama_kv_cache ctor
+3551c9b llama : add the PLE conv plane to llama_memory_recurrent
+0c460a6 ggml : give ggml_backend_cuda_gdn_fold model-defined head counts
+17e3d08 llama : write logical_pos for every applied KV cell
+73d0bcb qwen35 : capture pre-RoPE Q and K for KVMem
+92d5bbf common : add --kvmem options and set KVMem params before context init
+90e5c5d build : compile the KVMem attention sources
+2a662fa build : shim the ggml precision setter for the KVMem adapter
+089a945 common : find kvmem headers and match the KVMem defaults
+0af8e64 graph : capture attention operands for KVMem sampling
+b8382e6 server : restore prism oaicompat chat parse (KVMem duplicate broke its return)
+6510309 server : inject the KVMem question span before decoding a request
+1173aac server : inject the KVMem question span, apply retrieval after prefill, keep prefix reuse
+6adcc56 build : enable the CUDA page-softmax retrieval scorer
+0873445 server : bypass KVMem capture and staging while the request fits the GPU pool
+ada0cbd server : bound the short-context bypass by the pool high watermark
+52318f4 mtmd : give image embedding batches monotonic cache rows
+12eb9d2 server : skip KVMem prefill hooks when the memory is disabled
+6b17bfb fix: resolve completion hole error caused by KVMem logical_pos discontinuity
+e996c36 fix: disable native prompt cache and checkpoints under KVMem
+b9620c5 server : stop generation when the client disconnects
+846ca6b docs : add the KVMem x prism production README and repro scripts
+008840f docs : document the prompt cache / checkpoint incompatibility
+061ee6d docs : document client disconnect cancellation
+5f1bafa docs : add final context-size, TTFT and warm-cache benchmarks
+9d2bbc7 server : add KVMem idle TTL eviction and memory pressure guard
 ```
 
 

@@ -1,3 +1,21 @@
+# Contributing to prism_kvmem
+
+This repository is a fork of llama.cpp. Fork-specific changes should:
+
+1. Build with the instructions in README section 3. KVMem builds need
+   `-DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=<kvmem-root>`; without it the fork
+   still builds and serves the multimodal OpenAI API.
+2. Keep upstream copyright and MIT license notices intact.
+3. Test at least one of: text chat, vision request, 8-turn agent trace,
+   long-context (128K/250K) request; see `docs/kvmem-prism/scripts/`.
+4. Never commit model weights, build directories, logs or credentials.
+5. Describe behavior/flag changes in README and keep `--kvmem-idle-ttl`,
+   prompt-cache and checkpoint constraints in mind (README sections 6.7, 8.5).
+
+The upstream llama.cpp contribution guide follows.
+
+---
+
 # Contributors
 
 The project differentiates between 3 levels of contributors:
