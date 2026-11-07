@@ -12,6 +12,7 @@ curl -fL https://github.com/Pcx6/prism_kvmem/releases/download/v0.1.0/quickstart
 脚本会下载二进制包（57 MB）与模型/视觉塔（约 6.2 GB），生成随机 API key，并在 `14803` 启动服务。
 自定义：`PORT=14803 API_KEY=my-key MODELS=/data/models curl ... | bash`。
 手动构建见第 3 节，Release 说明见 [v0.1.0](https://github.com/Pcx6/prism_kvmem/releases/tag/v0.1.0)。
+如需在执行前审查脚本内容，请查看 [quickstart.sh](https://raw.githubusercontent.com/Pcx6/prism_kvmem/main/quickstart.sh) 源码。
 
 
 本仓库是 Prism（qwen35 架构 27B 三值量化模型）的 llama.cpp 分支，把 KVMem 主机侧 KV 换页适配器编译进 Prism，并在此基础上完成：
@@ -59,7 +60,20 @@ curl -fL https://github.com/Pcx6/prism_kvmem/releases/download/v0.1.0/quickstart
 | `IMAGE_DIR` | - | 示例图片目录 |
 | `ARTIFACT_DIR` | - | 本地测试结果归档目录 |
 
-### 0.3 首次准备
+### 0.3 Dependencies & Licenses
+
+| 组件 | 许可证 | 说明 |
+|---|---|---|
+| `prism_kvmem`（本仓库新增部分） | MIT（`LICENSE`） | 服务器集成、部署脚本、文档 |
+| `llama.cpp`（上游） | MIT | 版权见 `AUTHORS`；`LICENSE` 同一份 MIT 文本 |
+| PrismML Prism 分支（上游基线） | MIT | 本仓库基于该分支构建 |
+| `KVMem adapter` | 不在本仓库分发 | `llama-kvmem-hooks.h`、`src/adapter/*` 为独立 KVMem 组件，由 KVMem 提供方按其许可提供；启用 `-DLLAMA_KVMEM=ON` 时需自行取得并遵守其条款 |
+| 模型权重（Ternary Bonsai 2 27B） | 依 Hugging Face 仓库许可 | 不在本仓库分发，由 `deploy/download-models.sh` 下载 |
+| 视觉塔（mmproj Q8_0） | 依上游模型许可 | 同上 |
+
+若你是 KVMem adapter 的版权方并希望补充具体许可证文本，欢迎提 PR 或在 issue 中说明。
+
+### 0.4 首次准备
 
 推荐直接用 Release 的一键脚本（见文首）。源码方式：
 
