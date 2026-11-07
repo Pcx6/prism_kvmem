@@ -27,8 +27,13 @@ jobs:
           if git ls-files | grep -E '\.(rej|orig)$'; then
             echo "patch leftovers found"; exit 1
           fi
-      - name: No model weights or build trees tracked
+      - name: No build trees
         run: |
-          if git ls-files | grep -E '^(build|models/[^/]+\.gguf$)' ; then
-            echo "unexpected build or weight files"; exit 1
+          if git ls-files | grep -E '^build/|^build-[^/]+/'; then
+            echo "build directories are tracked"; exit 1
+          fi
+      - name: No model weights
+        run: |
+          if git ls-files 'models/*.gguf' | grep -v '^models/ggml-vocab-'; then
+            echo "model weights are tracked (upstream vocab fixtures excepted)"; exit 1
           fi
