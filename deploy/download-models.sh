@@ -1,6 +1,6 @@
 #!/bin/bash
 # Download the model and vision projector from Hugging Face.
-# Usage: DEST=models ./scripts/download-models.sh
+# Usage: DEST=models ./deploy/download-models.sh
 set -euo pipefail
 
 DEST="${DEST:-models}"

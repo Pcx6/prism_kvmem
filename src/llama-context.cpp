@@ -1754,7 +1754,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool chain_stats = chain_stats_on && cparams.mtp_chain_n > 0;
     const int64_t t_cs0 = chain_stats ? ggml_time_us() : 0;
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && res->can_reuse(gparams)
+#if defined(LLAMA_KVMEM)
+        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, 1, ubatch.logical_pos ? ubatch.logical_pos : ubatch.pos,
+                                         gtype == LLM_GRAPH_TYPE_DECODER_MTP)
+#endif
+            ) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

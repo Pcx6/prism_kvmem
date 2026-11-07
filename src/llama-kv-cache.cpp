@@ -1906,7 +1906,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos sp_min = cells.seq_pos_min(seq_id);
             const llama_pos sp_max = cells.seq_pos_max(seq_id);
             const bool holes = sp_min >= 0 && sp_max >= sp_min &&
-                cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
+                cells.get_used_seq(seq_id) < (uint32_t) (sp_max - sp_min + 1);
 
             if (!alibi && !holes) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {

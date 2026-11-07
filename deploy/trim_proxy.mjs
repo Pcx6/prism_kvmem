@@ -20,17 +20,25 @@ import crypto from 'node:crypto';
 import { URL } from 'node:url';
 
 const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:14803';
-const LISTEN_HOST = process.env.LISTEN_HOST || '0.0.0.0';
+const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
 const LISTEN_PORT = Number(process.env.LISTEN_PORT || 14802);
 const MAX = Number(process.env.TRIM_MAX || 2048);
 const HEAD = Number(process.env.TRIM_HEAD || 1000);
 const TAIL = Number(process.env.TRIM_TAIL || 1000);
-const API_KEY = process.env.TRIM_API_KEY || crypto.randomBytes(24).toString('hex');
+const API_KEY = process.env.TRIM_API_KEY;
 // Optional second backend for staged rollouts. Disabled while GRAYSCALE_PERCENT is 0.
 // Selection is sticky per session when the caller sends a session/ conversation id.
 const UPSTREAM_GRAY = process.env.UPSTREAM_GRAY || '';
 const GRAYSCALE_PERCENT = Number(process.env.GRAYSCALE_PERCENT || 0);
 const TRIM_DEBUG = process.env.TRIM_DEBUG === '1';
+const MAX_BODY = Number(process.env.TRIM_MAX_BODY || 64 * 1024 * 1024);
+const GRAY_SALT = process.env.TRIM_GRAY_SALT || '';
+if (!(MAX > HEAD + TAIL)) {
+  throw new Error('TRIM_MAX must be greater than TRIM_HEAD + TRIM_TAIL');
+}
+if (!process.env.TRIM_API_KEY) {
+  throw new Error('TRIM_API_KEY is required');
+}
 
 function sessionKey(headers, parsed) {
   const h = headers['x-session-id'] || headers['x-conversation-id'] || headers['x-request-session'];
@@ -44,12 +52,13 @@ function sessionKey(headers, parsed) {
 
 function bucketOf(key) {
   if (!key) return Math.floor(Math.random() * 100);
-  const h = crypto.createHash('sha256').update(String(key)).digest();
+  const h = crypto.createHash('sha256').update(GRAY_SALT + ':' + String(key)).digest();
   return h.readUInt32BE(0) % 100;
 }
 
 export function pickUpstream(headers, parsed) {
   if (!UPSTREAM_GRAY || GRAYSCALE_PERCENT <= 0) return UPSTREAM;
+  if (!GRAY_SALT) return UPSTREAM;
   return bucketOf(sessionKey(headers || {}, parsed)) < GRAYSCALE_PERCENT ? UPSTREAM_GRAY : UPSTREAM;
 }
 
@@ -144,6 +153,7 @@ const agent = new URL(UPSTREAM).protocol === 'https:' ? https : http;
 const stats = { requests: 0, denied: 0, trimmed: 0, bytesIn: 0, bytesOut: 0 };
 
 const server = http.createServer((req, res) => {
+  req.setTimeout(120000, () => req.destroy());
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
   if (!authorized(req.headers)) {
     stats.denied += 1;
@@ -165,7 +175,19 @@ const server = http.createServer((req, res) => {
   res.on('close', () => {
     if (!res.writableEnded && !res.writableFinished) abortUpstream('client closed connection');
   });
-  req.on('data', (c) => chunks.push(c));
+  let bytes = 0;
+  req.on('data', (c) => {
+    bytes += c.length;
+    if (bytes > MAX_BODY) {
+      if (!res.headersSent) {
+        res.writeHead(413, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'request body too large', type: 'invalid_request' } }));
+      }
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
   req.on('end', () => {
     let body = Buffer.concat(chunks);
     stats.requests += 1;
@@ -182,13 +204,17 @@ const server = http.createServer((req, res) => {
         if (after.length !== before) {
           stats.trimmed += 1; stats.bytesIn += before; stats.bytesOut += after.length;
           process.stderr.write('[trim] #' + stats.requests + ' ' + before + ' -> ' + after.length + ' bytes\n');
+          body = after;
         }
-        body = after;
       } catch { /* unparsable body: forward untouched */ }
     }
     const upstreamBase = pickUpstream(req.headers, parsed);
     const up = new URL(upstreamBase + req.url);
     const headers = { ...req.headers, host: up.host };
+    for (const h of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+                     'te', 'trailer', 'transfer-encoding', 'upgrade']) {
+      delete headers[h];
+    }
     delete headers['content-length'];
     headers['content-length'] = String(body.length);
     if (upstreamBase !== UPSTREAM) {
@@ -215,7 +241,6 @@ const server = http.createServer((req, res) => {
 
 if (process.env.PROXY_LIB_ONLY !== '1') {
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-    process.stdout.write('[auth] API Key: ' + API_KEY + '\n');
     process.stdout.write('[trim] listening on ' + LISTEN_HOST + ':' + LISTEN_PORT + ' -> ' + UPSTREAM +
       ' (max=' + MAX + ' head=' + HEAD + ' tail=' + TAIL + ')\n');
   });

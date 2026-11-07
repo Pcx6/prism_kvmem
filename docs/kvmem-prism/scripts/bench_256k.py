@@ -11,7 +11,7 @@ a = ap.parse_args()
 
 text = open(a.prompt_file, encoding="utf-8").read()
 body = {"messages": [{"role": "user", "content": text}],
-        "max_tokens": a.max_tokens, "temperature": 0.0}
+        "max_tokens": a.max_tokens, "temperature": 0.0, "cache_prompt": False}
 headers = {"Content-Type": "application/json"}
 if a.key:
     headers["Authorization"] = "Bearer " + a.key

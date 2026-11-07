@@ -642,6 +642,7 @@ struct common_params {
     int32_t kvmem_cpu_gb        = 0;     // CPU spill arena in GiB; 0 = off
     float   kvmem_gpu_ratio     = 0.0f;  // slot pool cap vs VRAM; 0 = 0.50
     int32_t kvmem_idle_ttl      = 86400; // seconds of idle before evicting a slot's KV; 0 = never
+    int32_t kvmem_query_max_tokens = 512; // max tokens kept from the user question for retrieval
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

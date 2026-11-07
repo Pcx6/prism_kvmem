@@ -907,6 +907,7 @@ private:
 
     // rate limit for the KVMem idle TTL scan
     int64_t t_kvmem_ttl_check = 0;
+    int kvmem_low_ticks = 0;
 
     server_metrics metrics;
 
@@ -1015,6 +1016,17 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+        if (params.kvmem && !params.slot_save_path.empty()) {
+            SRV_WRN("%s\n", "slot save/restore is disabled when KVMem is enabled");
+        }
+        if (params.kvmem && params_base.n_parallel > 1) {
+            SRV_WRN("%s\n", "KVMem request span is process-wide; -np > 1 is not supported");
+        }
+        if (params.kvmem && has_spec) {
+            SRV_ERR("%s\n", "KVMem does not support speculative decoding; disable speculative decoding or KVMem");
+            return false;
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1409,9 +1421,11 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+#if defined(LLAMA_KVMEM)
         queue_tasks.on_idle_tick([this]() {
             kvmem_idle_tick();
         });
+#endif
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -1816,8 +1830,10 @@ private:
             const int64_t kvmem_threshold = (int64_t) (kvmem_pool * kvmem_high);
             // a request that fits entirely in the GPU pool needs no host mirror, capture,
             // staging or retrieval: keep the native attention path only
+            const int64_t n_predict = slot.task->params.n_predict;
+            const int64_t n_reserve = n_predict > 0 ? n_predict : 0;
             slot.kvmem_short_bypass = kp->enabled && kvmem_threshold > 0 &&
-                    (int64_t) slot.task->n_tokens() < kvmem_threshold;
+                    (int64_t) slot.task->n_tokens() + n_reserve < kvmem_threshold;
             // going back to the staged path: the previous short turn filled no host mirror,
             // so the first long turn must evaluate the whole prompt again
             slot.kvmem_force_full = kp->enabled && !slot.kvmem_short_bypass && slot.kvmem_last_bypass;
@@ -1836,6 +1852,8 @@ private:
             if (slot.task->params.kvmem_qbegin >= 0) {
                 SLT_INF(slot, "KVMEM_REQUEST_SPAN begin=%d end=%d n_tokens=%d\n",
                         slot.task->params.kvmem_qbegin, slot.task->params.kvmem_qend, slot.task->n_tokens());
+            } else {
+                SLT_WRN(slot, "%s", "KVMEM_REQUEST_SPAN unavailable, using recency fallback\n");
             }
         }
 #endif
@@ -2812,7 +2830,12 @@ private:
             kvmem_evict_idle_slots("idle_ttl", (int64_t) params_base.kvmem_idle_ttl * 1000000, false);
         }
         if (kvmem_memory_low()) {
-            kvmem_evict_idle_slots("oom_guard", 0, true);
+            if (++kvmem_low_ticks >= 3) {
+                kvmem_low_ticks = 0;
+                kvmem_evict_idle_slots("oom_guard", 0, true);
+            }
+        } else {
+            kvmem_low_ticks = 0;
         }
     }
 
@@ -2842,7 +2865,12 @@ private:
         }
 #if defined(__GLIBC__)
         if (any) {
+            const int64_t t0 = ggml_time_us();
             malloc_trim(0);
+            const double ms = (ggml_time_us() - t0) / 1000.0;
+            if (ms > 50.0) {
+                SRV_WRN("malloc_trim took %.1f ms\n", ms);
+            }
         }
 #endif
         return any;
@@ -2862,6 +2890,8 @@ private:
         if (avail_kb >= 0 && (int64_t) avail_kb * 1024 < (int64_t) 1536 * 1024 * 1024) {
             return true;
         }
+        size_t max_free_b = 0;
+        size_t total_free_b = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -2870,10 +2900,11 @@ private:
             size_t free_b = 0;
             size_t total_b = 0;
             ggml_backend_dev_memory(dev, &free_b, &total_b);
-            if (free_b > 0 && free_b < (size_t) 1024 * 1024 * 1024) {
-                return true;
-            }
+            max_free_b = std::max(max_free_b, free_b);
+            total_free_b += free_b;
         }
+        // all GPUs low: one small card occupied by another process must not evict every second
+        return total_free_b > 0 && max_free_b < (size_t) 1024 * 1024 * 1024;
         return false;
     }
 #endif
@@ -2998,7 +3029,7 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.task &&
+            if (slot.state != SLOT_STATE_IDLE && slot.task &&
                     slot.task->should_stop && slot.task->should_stop()) {
                 SLT_INF(slot, "client disconnected, releasing slot (n_tokens = %d)\n", slot.prompt.n_tokens());
                 slot.release();
@@ -4571,6 +4602,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         pos = ptext.rfind(utext);
                     }
                 }
+                const auto tokens_full = common_tokenize(ctx_server.vocab, ptext, true, true);
+                if (tokens_full.size() != task.tokens.size()) {
+                    SRV_WRN("%s\n", "KVMem span skipped: tokenization mismatch (media prompt), using tail fallback");
+                    pos = std::string::npos;
+                }
                 if (pos != std::string::npos) {
                     const auto tokens_pre  = common_tokenize(ctx_server.vocab, ptext.substr(0, pos), true, true);
                     const auto tokens_thru = common_tokenize(ctx_server.vocab, ptext.substr(0, pos + utext.size()), true, true);
@@ -4583,16 +4619,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // question, mirroring the reference server's 512-token --kvmem-query-max-tokens tail
             if (task.params.kvmem_qbegin < 0) {
                 const int32_t n_tokens = (int32_t) task.tokens.size();
-                constexpr int32_t kvmem_query_max_tokens = 512;
+                const int32_t kvmem_query_max_tokens = std::max(1, params.kvmem_query_max_tokens);
                 task.params.kvmem_qbegin = std::max(0, n_tokens - kvmem_query_max_tokens);
                 task.params.kvmem_qend   = n_tokens;
             }
+            const int32_t kvmem_query_max_tokens = std::max(1, params.kvmem_query_max_tokens);
             if (task.params.kvmem_qend > task.params.kvmem_qbegin) {
-                constexpr int32_t kvmem_query_max_tokens = 512;
                 task.params.kvmem_qbegin = std::max(task.params.kvmem_qbegin, task.params.kvmem_qend - kvmem_query_max_tokens);
             } else {
-                task.params.kvmem_qbegin = -1;
-                task.params.kvmem_qend   = -1;
+                const int32_t n_tokens = (int32_t) task.tokens.size();
+                task.params.kvmem_qbegin = std::max(0, n_tokens - kvmem_query_max_tokens);
+                task.params.kvmem_qend   = n_tokens;
             }
 #endif
 
@@ -5573,6 +5610,10 @@ void server_routes::init_routes() {
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
     auto res = create_response();
+    if (params.kvmem) {
+        res->error(format_error_response("slot save/restore is not supported with KVMem", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
     if (!fs_validate_filename(filename)) {
@@ -5609,6 +5650,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const server_http_req & req, int id_slot) {
     auto res = create_response();
+    if (params.kvmem) {
+        res->error(format_error_response("slot save/restore is not supported with KVMem", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
     if (!fs_validate_filename(filename)) {

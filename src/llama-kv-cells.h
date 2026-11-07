@@ -82,6 +82,14 @@ public:
         return used.size();
     }
 
+    // number of distinct positions of seq_id currently present
+    uint32_t get_used_seq(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return (uint32_t) seq_pos[seq_id].size();
+    }
+
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {

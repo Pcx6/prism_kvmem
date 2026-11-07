@@ -58,3 +58,7 @@ Thumbs.db
 # Rust / misc
 target/
 node_modules/
+
+# Patch leftovers
+*.rej
+*.orig

@@ -1,3 +1,6 @@
+> HISTORICAL SNAPSHOT (2026-11-06). Merge counts and numbers may be stale.
+> Current behavior, flags and limitations: ../../README.md.
+
 # KVMem -> Prism 合并报告（2026-11-06）
 
 ## 结论（先说结果）
@@ -16,7 +19,7 @@ root cause 不是"补丁太大"，而是**两套同源代码在同一个子系�
 ## 已完成的工作
 
 1. **G0**：从 `kvmem-root/patches/llama-kvmem-current.patch` 提取补丁（1,918 行 / 41 文件），
-   在 `/workspace/prism_kvmem` 建独立副本（prism 源码 + 新 git 仓）。
+   在 `$REPO` 建独立副本（prism 源码 + 新 git 仓）。
 2. **自动应用**：`git apply --reject` → **56 个文件干净应用**，17 个文件产生 35 个 reject。
 3. **手工合并（已完成）**：
    - 新增 ggml op `GGML_OP_GATED_DELTA_NET_RECORD`：enum、name/symbol 表、`GGML_OP_COUNT` 102→103、CUDA supports_op case；
@@ -57,4 +60,4 @@ CTX=131072 B=16384 R=2048 HOST_MIB=8192 CPU_GB=8 PORT=14805 NOKV=0 \
 
 - 生产 14802/14803：未改配置、未重启、未杀；代理验证 200。
 - 未触碰 `ninfer_attack/`、`strata_qwen38/`；未改 CPU/电源/MSR。
-- 合并工作全部在 `/workspace/prism_kvmem/`。
+- 合并工作全部在 `$REPO/`。

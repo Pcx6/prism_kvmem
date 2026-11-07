@@ -1,18 +1,18 @@
-# Prism x KVMem 生产融合说明
+# prism_llama_kvmem_v100 - Prism x KVMem 生产融合说明
 
-[![Release](https://img.shields.io/github/v/release/Pcx6/prism_kvmem)](https://github.com/Pcx6/prism_kvmem/releases)
+[![Release](https://img.shields.io/github/v/release/Pcx6/prism_llama_kvmem_v100)](https://github.com/Pcx6/prism_llama_kvmem_v100/releases)
 
 ## 快速安装（一键启动）
 
 ```bash
-curl -fL https://github.com/Pcx6/prism_kvmem/releases/download/v0.1.0/quickstart.sh | bash
+curl -fL https://github.com/Pcx6/prism_llama_kvmem_v100/releases/download/v0.1.0/quickstart.sh | bash
 ```
 
 要求：Linux x86_64、NVIDIA **sm_70（V100）** 或兼容驱动、Python 3、约 8 GB 磁盘。
 脚本会下载二进制包（57 MB）与模型/视觉塔（约 6.2 GB），生成随机 API key，并在 `14803` 启动服务。
 自定义：`PORT=14803 API_KEY=my-key MODELS=/data/models curl ... | bash`。
-手动构建见第 3 节，Release 说明见 [v0.1.0](https://github.com/Pcx6/prism_kvmem/releases/tag/v0.1.0)。
-如需在执行前审查脚本内容，请查看 [quickstart.sh](https://raw.githubusercontent.com/Pcx6/prism_kvmem/main/quickstart.sh) 源码。
+手动构建见第 3 节，Release 说明见 [v0.1.0](https://github.com/Pcx6/prism_llama_kvmem_v100/releases/tag/v0.1.0)。
+如需在执行前审查脚本内容，请查看 [quickstart.sh](https://raw.githubusercontent.com/Pcx6/prism_llama_kvmem_v100/main/deploy/quickstart.sh) 源码。
 Release 资产 `prism_kvmem-v0.1.0-linux-sm70.tar.gz` 的 SHA256：`da4e917a2fdd62d2a30d25f488d674c0a41d24692d3a21679f83504bb928a30d`（下载后可用 `sha256sum` 校验）。
 
 
@@ -68,9 +68,11 @@ Release 资产 `prism_kvmem-v0.1.0-linux-sm70.tar.gz` 的 SHA256：`da4e917a2fdd
 | `prism_kvmem`（本仓库新增部分） | MIT（`LICENSE`） | 服务器集成、部署脚本、文档 |
 | `llama.cpp`（上游） | MIT | 版权见 `AUTHORS`；`LICENSE` 同一份 MIT 文本 |
 | PrismML Prism 分支（上游基线） | MIT | 本仓库基于该分支构建 |
-| `KVMem adapter` | 不在本仓库分发 | `llama-kvmem-hooks.h`、`src/adapter/*` 为独立 KVMem 组件，由 KVMem 提供方按其许可提供；启用 `-DLLAMA_KVMEM=ON` 时需自行取得并遵守其条款 |
+| `KVMem adapter` | 未随仓库声明许可证 | `llama-kvmem-hooks.h`、`src/adapter/*` 为独立组件，来源方未提供 LICENSE；启用 `-DLLAMA_KVMEM=ON` 前请与提供方确认许可，本项目不为其再分发授权 |
 | 模型权重（Ternary Bonsai 2 27B） | 依 Hugging Face 仓库许可 | 不在本仓库分发，由 `deploy/download-models.sh` 下载 |
 | 视觉塔（mmproj Q8_0） | 依上游模型许可 | 同上 |
+| Release 二进制 | 含 KVMem `libkvmem` | 仅为个人测试构建；KVMem adapter 许可未明，禁止未经授权再分发或商用 |
+| 第三方组件（Yukon tokenizer 等） | 随上游模型 | 见模型仓库的 LICENSE/NOTICE |
 
 若你是 KVMem adapter 的版权方并希望补充具体许可证文本，欢迎提 PR 或在 issue 中说明。
 
@@ -79,7 +81,7 @@ Release 资产 `prism_kvmem-v0.1.0-linux-sm70.tar.gz` 的 SHA256：`da4e917a2fdd
 推荐直接用 Release 的一键脚本（见文首）。源码方式：
 
 ```bash
-git clone https://github.com/Pcx6/prism_kvmem.git && cd prism_kvmem
+git clone https://github.com/Pcx6/prism_llama_kvmem_v100.git && cd prism_kvmem
 cp .env.example .env          # 填入 MODEL/MMPROJ/API_KEY（.env 已被 .gitignore）
 ./deploy/download-models.sh   # 默认下载到 models/
 set -a; . ./.env; set +a
@@ -95,7 +97,7 @@ set -a; . ./.env; set +a
 | API 名称 | `Bonsai-2-27B`（启动参数 `-a Bonsai-2-27B`） |
 | KVMem | `--kvmem --kvmem-budget 12288 --kvmem-gen-reserve 22528`（GPU 池 34816 token） |
 | 短路阈值 | `0.95 x pool = 33075` token，低于此值走原生注意力快速路径 |
-| 显存 | 启动 9395 MiB（含视觉），峰值约 9.7-9.9 GB / 16 GB |
+| 显存 | 启动 9395 MiB（含视觉）；短请求峰值约 9.7-9.9 GB，长上下文 10.7-10.8 GB / 16 GB |
 | 长文 | 128K prefill 约 564 t/s，250K 约 546 t/s（换页开启） |
 | 短请求 | 32K 冷启动约 690 t/s；8 轮 Agent 23-24 s（总 TTFT 13.6-14.1 s） |
 | 视觉 | OCR 与图片描述正常，TTFT 1.0-3.6 s，单图 8-29 s |
@@ -119,6 +121,8 @@ set -a; . ./.env; set +a
 3. 在 `launch_slot_with_task` 里调 `llama_kvmem_set_request_span(qbegin, qend, force)`，日志 `KVMEM_REQUEST_SPAN begin=... end=...`。
 4. prefill 结束后调 `end_prefill_capture / apply_retrieval / pin_working_set / attention_begin`，把冷块拉回 GPU 再进入生成。
 5. 打分用 CUDA 版 page softmax（`KVMEM_PAGE_SOFTMAX_CUDA`）；CPU 版在 256K 上会跑 >10 分钟。
+
+注意：span 只对 `/v1/chat/completions` 注入；`/completion`、`/v1/completions`、infill、`/v1/responses` 等走 prompt 末尾 512 token 回退。定位失败时日志为 `KVMEM_REQUEST_SPAN unavailable`，不会静默。
 
 ### 2.3 短上下文短路
 
@@ -246,7 +250,7 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 
 ```bash
 pgrep -a -x llama-server                 # 生产进程
-kill -9 <pid>                            # 服务会忽略 SIGTERM，需 -9
+kill -9 <pid>                            # SIGTERM 有处理器；卡住时用 -9
 nohup setsid $REPO/deploy/start-llama.sh \
   > fused_prod.log 2>&1 &
 
@@ -287,6 +291,8 @@ curl -X POST -H "Authorization: Bearer $KEY" \
 
 ## 5. 参数选型
 
+> 下表的「默认」是生产脚本 `deploy/start-llama.sh` 的取值；程序内置默认见 `--help`（例如 `--kvmem-budget` 程序默认 32768，生产用 12288）。
+
 ### 5.1 budget 扫描（128K 请求，16 GB 卡）
 
 | budget | 启动显存 | 128K 峰值 | 128K prefill / decode | 短路实测 |
@@ -318,6 +324,25 @@ curl -X POST -H "Authorization: Bearer $KEY" \
 
 跨阈值场景（8K -> 40K -> 8K）：8.9 s -> 63.1 s（`KVMEM_BYPASS_EXIT` 整体重算）-> 9.3 s，行为正常。
 
+
+### 5.4 KVMem 参数（程序默认 vs 生产脚本）
+
+| 参数 | 程序默认 | 生产值 | 说明 |
+|---|---|---|---|
+| `--kvmem` | off | on | 启用适配器 |
+| `--kvmem-budget` | 32768 | 12288 | GPU 工作集 |
+| `--kvmem-gen-reserve` | 1024 | 22528 | 生成预留 |
+| `--kvmem-block-tokens` | 32 | 32 | 块大小 |
+| `--kvmem-sink-tokens` | 0 | 0 | 固定保留前缀 |
+| `--kvmem-recent-tokens` | 64 | 64 | 固定保留后缀 |
+| `--kvmem-method` | retrieval | retrieval | retrieval/recency |
+| `--kvmem-host-mib` | 0 | 0 | host KV 配额，0 不限 |
+| `--kvmem-cpu-gb` | 0 | 0 | CPU spill，0 关 |
+| `--kvmem-gpu-ratio` | 0 | 0 | 占空闲显存比例，0 由适配器取 0.50 |
+| `--kvmem-query-max-tokens` | 512 | 512 | 检索 query 上限 |
+| `--kvmem-idle-ttl` | 86400 | 86400 | 空闲清理秒数，0 禁用 |
+
+`harvest_v` 与 `mtp_state` 仍只在 adapter 内部使用，没有 CLI；MTP/投机解码与 KVMem 同时启用会在启动时被拒绝。
 
 ## 6. 极限上下文实测（收口）
 
@@ -418,7 +443,7 @@ OOM 兜底（同一提交）：
 - 短路阈值以上（>33075）的请求走 KVMem 换页，8 轮 Agent 若单轮上下文超过 33K 会退回非短路路径，每轮多约 1.2 s。
 - M-RoPE 图像批次仍会打印 `find_slot: non-consecutive token position ...`（2D 位置本身非连续，属上游行为），不影响正确性。
 - 256K 在池 >34816 时会明显变慢；需要长文速度时保持当前配置。
-- 进程忽略 SIGTERM，清理用 `kill -9`。
+- server 注册了 SIGTERM 处理器；若进程卡在 decode，仍需 `kill -9`。
 - KV 空闲 TTL 默认 1 天，只清理 IDLE slot；GPU KV 池是固定分配，清理不回退池显存，只释放行与主机内存。
 - RAM prompt cache / 原生 checkpoint 在 KVMem 下被禁用（避免 store 与原生 KV 不一致），跨请求只有 slot 前缀复用。
 
@@ -429,7 +454,7 @@ OOM 兜底（同一提交）：
 
 - 现象：生产 14803 偶发，文本请求命中前缀缓存后被拒绝（`kv_content.cpp:59`）。
 - 根因：M-RoPE 图像 chunk 的 `n_tokens` 与 `n_pos` 不一致（330 vs 22）。早期修复用位置基址填图像行，文本批次又不带行号，导致图像行与文本行重叠/错位；KVMem 完成围栏按行号校验，触发 hole。
-- 修复（`96b6d89`）：
+- 修复（`6b17bfb`）：
   - server 所有 batch 显式携带 `logical_pos`（prompt 行号 + 生成行号连续）；
   - mtmd 新增 `mtmd_helper_decode_image_chunk_rows`，图像行从 `row_0` 起算；
   - 文本行紧接图像行，位置与行号解耦。
@@ -438,7 +463,7 @@ OOM 兜底（同一提交）：
 ### 8.2 KVMem + 多模态直接失败
 
 早期加 `--mmproj` 后图片请求报 `failed to decode mtmd chunk, idx=..., res=1`，日志 `init_batch: failed to prepare KVMem attention ubatches`。
-原因：mtmd embedding batch 带 4 维 M-RoPE 位置且首维重复，KVMem 行分配要求一维连续。修复见 8.1（`4232755` + `96b6d89`）。
+原因：mtmd embedding batch 带 4 维 M-RoPE 位置且首维重复，KVMem 行分配要求一维连续。修复见 8.1（`52318f4` + `6b17bfb`）。
 
 ### 8.3 256K 打分卡死
 
@@ -452,7 +477,7 @@ KVMem 的 `seq_pos_min` 返回原生行位置，触发 Prism 的 checkpoint 回�
 
 - 现象：短文本请求偶发 `Context size exceeded`，随后同一会话连续 `completion leaves a hole`；重启后恢复。
 - 根因：server 自带的 RAM prompt cache（`--cache-ram`，默认 8192 MiB）和原生 context checkpoint 会保存/恢复**原生 KV 状态**；KVMem 的 store 不在其中，恢复后 token 数、行号和 store 行数分叉（实测恢复后 prompt 16411 token，store 只有 15879 行），KVMem 准备 batch 失败 → 重试到 1 token → Context exceeded → 完成围栏报 hole。
-- 修复（`f1e1646`）：
+- 修复（`e996c36`）：
   - KVMem 启用时强制关闭 RAM prompt cache 与原生 checkpoint（server 内守卫），启动脚本加 `--cache-ram 0 -ctxcp 0`；
   - 前缀截断在位置删除之后追加 `llama_kvmem_remove_logical` 行级清除，避免媒体行残留。
 - 复现：8K 文本 + 图片 + 8K 文本，随后多次更短前缀复用，3 轮即触发；修复后 12/12 请求通过。
@@ -463,14 +488,14 @@ KVMem 的 `seq_pos_min` 返回原生行位置，触发 Prism 的 checkpoint 回�
 - 根因：
   - `trim_proxy.mjs` 未监听客户端断连，客户端走了它仍保持上游连接；
   - llama-server 生成循环从不轮询连接状态，HTTP 层虽然提供了 `req.should_stop`（`is_connection_closed`），但没有传入任务。
-- 修复（`9cfb691`，代理同步修改）：
+- 修复（`b9620c5`，代理同步修改）：
   - 代理：`req.aborted` / `res.close`（未正常结束）时 `upstreamReq.destroy()`，日志 `[abort] #N client closed connection`；
   - server：`server_task` 携带 `should_stop`，`pre_decode()` 发现连接已断立即 `slot.release()`，日志 `client disconnected, releasing slot (n_tokens = ...)`。
 - 验证：生成 2 秒后断开，服务端在 n_tokens=185/251 处停止（不是 5000）；GPU 利用率 98% -> 0% 在 0.4 秒内；连续 3 次中断后普通请求与 SSE 均 200，无 hole、无 Context exceeded。
 
 ### 8.7 其他
 
-- 服务器偶发忽略 SIGTERM，`kill` 无效时用 `kill -9`。
+- 服务器有 SIGTERM 处理器；若 decode 阻塞导致无法退出，用 `kill -9`。
 - 用 `pkill -f 'trim_proxy.mjs'` 会匹配到执行命令本身，建议按端口/进程号精确杀。
 
 
@@ -530,14 +555,15 @@ b9620c5 server : stop generation when the client disconnects
 
 | 脚本 | 用途 |
 |---|---|
-| `bench_128k.py` | 128K prefill/decode（`--port/--key`，默认 14802） |
+| `make_prompts.py` | 生成确定性长文本夹具（128K/250K/100K，无需外网） |
+| `bench_128k.py` | 128K prefill/decode（`--port/--key`，默认 14802，冷启动 cache_prompt=false） |
 | `bench_256k.py` | 256K prefill/decode |
 | `bench_agent_8turn.py` | 8 轮 Agent 轨迹，输出逐轮 TTFT 与总耗时 |
 | `bench_quality_100k.py` | 100K 文档开头事实检索（`ORANGE-FALCON-42`） |
 | `bench_bypass_cold.py` | 指定 token 数的冷启动短路测试 |
 | `test_vision.py` | 图片 OCR/描述，输出 TTFT 与文本 |
-| `repro_prefix_reuse.py` | 长请求后短前缀复用（hole 回归） |
-| `repro_multimodal_reuse.py` | 图像请求后文本前缀复用（hole 回归） |
+| `repro_prefix_reuse.py` | 长请求后短前缀复用（hole 回归；位置参数 port key [ngen]） |
+| `repro_multimodal_reuse.py` | 图像请求后文本前缀复用（hole 回归；位置参数 port key，图片用 IMAGE_FILE） |
 | `deploy/start-llama.sh` | 生产启动（env：MODEL/MMPROJ/API_KEY） |
 | `deploy/start-llama-prism.sh` | 回滚：无 KVMem/视觉，131072 ctx |
 | `deploy/trim_proxy.mjs` | 14802 代理（断连中止、tool 裁剪、灰度预留） |
@@ -602,7 +628,7 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 - **权重**：`*.gguf` 默认忽略；`git ls-files '*.gguf'` 只应列出上游词表夹具 `models/ggml-vocab-*.gguf`。
 - **构建产物**：`build-sm70/` 已从索引移除；`.gitignore` 覆盖 `/build*/`、`*.so`、`*.o`、日志与运行状态。
 - **许可证**：MIT（`LICENSE`），上游 `AUTHORS` / `CONTRIBUTING.md` 保留。
-- **当前体积**：工作树跟踪文件约 12 MB；`.git` 约 156 MB（历史中包含旧构建产物）。
+- **当前体积**：跟踪文件约 160.5 MB（主要来自 `models/` 词表夹具与 `docs/ops/`）；`.git` 约 35 MB（2026-11-07 已用 filter-repo 清理 `build-sm70` 历史）。
 
 上传前建议自查：
 
@@ -612,12 +638,7 @@ git ls-files '*.gguf' | head
 git ls-files -z | xargs -0 du -h | sort -rh | head -10
 ```
 
-若需要轻量仓库，可在**备份后**重写历史（会改变所有 commit hash，README 中的历史 hash 随之失效）：
-
-```bash
-git filter-repo --path build-sm70 --invert-paths
-git gc --prune=now --aggressive
-```
+历史已在 2026-11-07 清理（`git filter-repo --path build-sm70 --invert-paths`）；旧 commit hash 已失效。如需再次清理，先做完整备份。
 
 或只推送一个干净的 squash 分支：
 

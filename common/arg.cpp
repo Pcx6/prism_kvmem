@@ -3582,9 +3582,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--kvmem-method"}, "MODE",
         "KVMem block selection method: retrieval or recency (default: retrieval)",
         [](common_params & params, const std::string & value) {
+            if (value != "retrieval" && value != "recency") {
+                throw std::invalid_argument("invalid --kvmem-method: " + value);
+            }
             params.kvmem_method = value == "recency" ? 0 : 1;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_METHOD"));
+    add_opt(common_arg(
+        {"--kvmem-sink-tokens"}, "N",
+        string_format("always-kept prefix tokens (default: %d)", params.kvmem_sink_tokens),
+        [](common_params & params, int value) {
+            params.kvmem_sink_tokens = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_SINK_TOKENS"));
+    add_opt(common_arg(
+        {"--kvmem-recent-tokens"}, "N",
+        string_format("always-kept newest suffix tokens (default: %d)", params.kvmem_recent_tokens),
+        [](common_params & params, int value) {
+            params.kvmem_recent_tokens = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_RECENT_TOKENS"));
+    add_opt(common_arg(
+        {"--kvmem-host-mib"}, "N",
+        string_format("host KV quota in MiB, 0 = unlimited (default: %d)", params.kvmem_host_mib),
+        [](common_params & params, int value) {
+            params.kvmem_host_mib = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_HOST_MIB"));
+    add_opt(common_arg(
+        {"--kvmem-cpu-gb"}, "N",
+        string_format("CPU spill arena in GiB, 0 = off (default: %d)", params.kvmem_cpu_gb),
+        [](common_params & params, int value) {
+            params.kvmem_cpu_gb = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_CPU_GB"));
+    add_opt(common_arg(
+        {"--kvmem-gpu-ratio"}, "F",
+        string_format("GPU slot pool cap as a fraction of free VRAM (default: %.2f)", params.kvmem_gpu_ratio),
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (ratio < 0.0f || ratio > 1.0f) {
+                throw std::invalid_argument("--kvmem-gpu-ratio must be in [0, 1]");
+            }
+            params.kvmem_gpu_ratio = ratio;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_GPU_RATIO"));
+    add_opt(common_arg(
+        {"--kvmem-query-max-tokens"}, "N",
+        string_format("max user-question tokens used as the retrieval query (default: %d)", params.kvmem_query_max_tokens),
+        [](common_params & params, int value) {
+            params.kvmem_query_max_tokens = std::max(1, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KVMEM_QUERY_MAX_TOKENS"));
     add_opt(common_arg(
         {"--kvmem-idle-ttl"}, "SECONDS",
         string_format("evict a slot's KVMem KV after this many idle seconds, 0 disables (default: %d)", params.kvmem_idle_ttl),
