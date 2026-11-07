@@ -6,12 +6,58 @@
 生产入口：`14803`（llama-server，KVMem + Vision，API 名 `Bonsai-2-27B`）→ `14802`（trim_proxy.mjs，裁剪 tool 结果并转发）。
 
 
+## 0. 仓库说明与获取权重
+
+- 本仓库是 **llama.cpp（MIT）的生产分支**，在此基础上完成 KVMem 适配、短上下文短路、检索、前缀复用、多模态与 TTL，技术细节见后续章节。
+- **模型权重不随仓库分发**（`.gitignore` 排除 `*.gguf`），用 `deploy/download-models.sh` 从 Hugging Face 拉取：
+  - 语言模型：`prism-ml/Ternary-Bonsai-2-27B-gguf` 中的 `Ternary-Bonsai-2-27B-PTQ1_0.gguf`
+  - 视觉塔：同仓库 `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`
+- **KVMem adapter 不在本仓库**：`-DLLAMA_KVMEM=ON` 需要把 `KVMEM_ROOT` 指向 kvmem-root 源码树；不使用 KVMem 时去掉这两个编译选项即可。
+- 许可证：MIT（见 `LICENSE`）；上游贡献规范见 `CONTRIBUTING.md`。
+
+### 0.1 仓库结构
+
+| 目录 | 用途 |
+|---|---|
+| `src/` `common/` `tools/` | llama.cpp 主体及本分支修改 |
+| `deploy/` | 启动脚本、代理、模型下载脚本（本分支新增） |
+| `docs/kvmem-prism/` | 本分支说明与基准/复现脚本 |
+| `README_KVMEM.md` | 本文档 |
+
+### 0.2 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `REPO` | 仓库根 | 脚本根目录 |
+| `MODEL` | 必需 | PTQ1_0 gguf 路径 |
+| `MMPROJ` | 必需 | 视觉塔 Q8_0 gguf 路径 |
+| `API_KEY` | 必需 | 客户端 Bearer token（放在仓库外） |
+| `API_KEY_FILE` | - | 存放 API_KEY 的文件路径（示例） |
+| `KVMEM_ROOT` | - | kvmem-root 源码路径（仅构建 KVMem 时） |
+| `PORT` / `CTX` | 14803 / 262144 | 监听端口 / 上下文 |
+| `KV_BUDGET` / `KV_GEN_RESERVE` | 12288 / 22528 | KVMem GPU 池 |
+| `KV_TTL` | 86400 | 空闲 KV 清理秒数，0 禁用 |
+| `PROMPT_FILE` | 各脚本默认 | 基准脚本的长文本文件 |
+| `IMAGE_FILE` | - | 多模态复现脚本的图片路径 |
+| `IMAGE_DIR` | - | 示例图片目录 |
+| `ARTIFACT_DIR` | - | 本地测试结果归档目录 |
+
+### 0.3 首次准备
+
+```bash
+git clone <this repo> && cd prism_kvmem
+cp .env.example .env          # 填入 MODEL/MMPROJ/API_KEY（.env 已被 .gitignore）
+./deploy/download-models.sh   # 默认下载到 models/
+set -a; . ./.env; set +a
+```
+
+
 ## 1. 生产现状速览
 
 | 项目 | 值 |
 |---|---|
-| 模型 | `/workspace/baseline_llama/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf`（5.6 GB，qwen35 hybrid GDN，262144 ctx） |
-| 视觉塔 | `/srv/models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`（601 MB，`qwen3vl_merger`，GPU offload） |
+| 模型 | `$MODEL`（5.6 GB，qwen35 hybrid GDN，262144 ctx） |
+| 视觉塔 | `$MMPROJ`（601 MB，`qwen3vl_merger`，GPU offload） |
 | API 名称 | `Bonsai-2-27B`（启动参数 `-a Bonsai-2-27B`） |
 | KVMem | `--kvmem --kvmem-budget 12288 --kvmem-gen-reserve 22528`（GPU 池 34816 token） |
 | 短路阈值 | `0.95 x pool = 33075` token，低于此值走原生注意力快速路径 |
@@ -20,7 +66,7 @@
 | 短请求 | 32K 冷启动约 690 t/s；8 轮 Agent 23-24 s（总 TTFT 13.6-14.1 s） |
 | 视觉 | OCR 与图片描述正常，TTFT 1.0-3.6 s，单图 8-29 s |
 | KV 空闲回收 | `--kvmem-idle-ttl 86400`（1 天）；到期释放 host KV，日志 `KVMEM_IDLE_EVICT` |
-| 回滚 | `/srv/llama_agent/start-llama-14803-prism.sh`（原生 prism，无 KVMem/视觉） |
+| 回滚 | `$REPO/deploy/start-llama-prism.sh`（原生 prism，无 KVMem/视觉） |
 
 
 ## 2. 架构
@@ -70,16 +116,18 @@
 环境：V100 16 GB，CUDA 12.8，sm_70，24 线程。
 
 ```bash
-cd /workspace/prism_kvmem
+cd $REPO
 cmake -B build-sm70 \
   -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
   -DLLAMA_KVMEM=ON \
-  -DLLAMA_KVMEM_ROOT=/workspace/baseline_llama/src/kvmem-root \
+  -DLLAMA_KVMEM_ROOT=$KVMEM_ROOT \
   -DLLAMA_BUILD_SERVER=ON -DGGML_NATIVE=ON
 cmake --build build-sm70 -j 12 --target llama-server
 ```
 
 产物：`build-sm70/bin/llama-server` 与同目录动态库（`libllama`、`libggml`、`libmtmd`、`libkvmem`）。运行需设置 `LD_LIBRARY_PATH=build-sm70/bin`。
+
+> KVMem adapter 不在本仓库：`KVMEM_ROOT` 指向 kvmem-root 源码树。不启用 KVMem 时去掉 `-DLLAMA_KVMEM=ON` 和 `-DLLAMA_KVMEM_ROOT=...`，其余功能（视觉、OpenAI API）照常构建。
 
 
 ## 4. 运行
@@ -88,24 +136,26 @@ cmake --build build-sm70 -j 12 --target llama-server
 
 ```bash
 # 1. 构建（首次或改代码后）
-cd /workspace/prism_kvmem
+cd $REPO
 cmake -B build-sm70 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
-  -DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=/workspace/baseline_llama/src/kvmem-root \
+  -DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=$KVMEM_ROOT \
   -DLLAMA_BUILD_SERVER=ON -DGGML_NATIVE=ON
 cmake --build build-sm70 -j 12 --target llama-server
 
 # 2. 启动推理服务（14803，KVMem + 视觉 + TTL 1 天）
-nohup setsid /srv/llama_agent/start-llama-14803.sh \
-  > /srv/llama_agent/fused_prod.log 2>&1 &
+export MODEL=$PWD/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+export MMPROJ=$PWD/models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
+export API_KEY=$(cat $API_KEY_FILE)
+nohup setsid $REPO/deploy/start-llama.sh > fused_prod.log 2>&1 &
 
 # 3. 启动代理（14802，公网入口）
-cd /srv/harness_agent
-TRIM_API_KEY=$(cat /srv/llama_agent/api_key.txt) UPSTREAM=http://127.0.0.1:14803 \
+cd $REPO/deploy
+TRIM_API_KEY=$API_KEY UPSTREAM=http://127.0.0.1:14803 \
   LISTEN_HOST=0.0.0.0 LISTEN_PORT=14802 nohup setsid node trim_proxy.mjs \
-  > /srv/harness_agent/trim_14802.log 2>&1 &
+  > trim_14802.log 2>&1 &
 
 # 4. 健康检查
-KEY=$(cat /srv/llama_agent/api_key.txt)
+KEY=$API_KEY
 curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:14803/health   # 200
 curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:14802/health   # 200
 
@@ -120,33 +170,24 @@ curl -s http://127.0.0.1:14802/v1/chat/completions \
 
 ### 4.1 生产启动
 
-`/srv/llama_agent/start-llama-14803.sh`：
+`$REPO/deploy/start-llama.sh`：
+
+环境变量（必需）：`MODEL`、`MMPROJ`、`API_KEY`；可选：`PORT`（14803）、`CTX`（262144）、`KV_BUDGET`（12288）、`KV_GEN_RESERVE`（22528）、`KV_TTL`（86400）、`THREADS`（24）、`LLAMA_BIN`。
 
 ```bash
-#!/bin/bash
-set -u
-ulimit -c 0
-export LD_LIBRARY_PATH=/workspace/prism_kvmem/build-sm70/bin
-KEY=$(cat /srv/llama_agent/api_key.txt)
-exec /workspace/prism_kvmem/build-sm70/bin/llama-server \
-  -m /workspace/baseline_llama/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-  --mmproj /srv/models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf \
-  -a Bonsai-2-27B \
-  -c 262144 -ngl 99 -t 24 -np 1 --reasoning on \
-  -ub 1024 -b 4096 -fa on --cache-reuse 256 --slot-save-path /srv/llama_agent/slots \
-  --cache-ram 0 -ctxcp 0 \
-  --kvmem --kvmem-budget 12288 --kvmem-gen-reserve 22528 --kvmem-idle-ttl 86400 \
-  --host 127.0.0.1 --port 14803 --api-key "$KEY"
+export MODEL=/path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+export MMPROJ=/path/to/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
+export API_KEY=$(cat $API_KEY_FILE)
+$REPO/deploy/start-llama.sh
 ```
 
 ### 4.2 代理
 
-14802 由 `/srv/harness_agent/trim_proxy.mjs` 提供，只裁剪 `role=tool` 的超长内容，不处理图片：
+14802 由 `$REPO/deploy/trim_proxy.mjs` 提供，只裁剪 `role=tool` 的超长内容，不处理图片：
 
 ```bash
-cd /srv/harness_agent
-TRIM_API_KEY=$(cat /srv/llama_agent/api_key.txt) \
-UPSTREAM=http://127.0.0.1:14803 \
+cd $REPO/deploy
+TRIM_API_KEY=$API_KEY UPSTREAM=http://127.0.0.1:14803 \
 LISTEN_HOST=0.0.0.0 LISTEN_PORT=14802 \
 node trim_proxy.mjs
 ```
@@ -154,7 +195,7 @@ node trim_proxy.mjs
 ### 4.3 调用示例
 
 ```bash
-KEY=$(cat /srv/llama_agent/api_key.txt)
+KEY=$API_KEY
 
 # 文本
 curl http://127.0.0.1:14802/v1/chat/completions \
@@ -163,7 +204,7 @@ curl http://127.0.0.1:14802/v1/chat/completions \
 
 # 视觉（base64 data URL）
 python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
-  --image /workspace/phototest/微信图片_20261003195102_3_8.png \
+  --image $IMAGE_DIR/微信图片_20261003195102_3_8.png \
   --prompt '逐字提取图片中的全部文字。' --max-tokens 800
 ```
 
@@ -172,12 +213,12 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 ```bash
 pgrep -a -x llama-server                 # 生产进程
 kill -9 <pid>                            # 服务会忽略 SIGTERM，需 -9
-nohup setsid /srv/llama_agent/start-llama-14803.sh \
-  > /srv/llama_agent/fused_prod.log 2>&1 &
+nohup setsid $REPO/deploy/start-llama.sh \
+  > fused_prod.log 2>&1 &
 
-curl -H "Authorization: Bearer $(cat /srv/llama_agent/api_key.txt)" \
+curl -H "Authorization: Bearer $API_KEY" \
   http://127.0.0.1:14803/health      # 期望 200
-curl -H "Authorization: Bearer $(cat /srv/llama_agent/api_key.txt)" \
+curl -H "Authorization: Bearer $API_KEY" \
   http://127.0.0.1:14802/health      # 期望 200
 nvidia-smi --query-gpu=memory.used --format=csv,noheader   # 期望 9-10 GB
 ```
@@ -186,9 +227,9 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader   # 期望 9-10 GB
 
 | 目标 | 脚本 |
 |---|---|
-| 原生 prism（无 KVMem、无视觉，131072 ctx） | `/srv/llama_agent/start-llama-14803-prism.sh` |
-| 有 KVMem、无视觉 | `/srv/llama_agent/start-llama-14803.sh.bak-mmproj` |
-| 14805 测试实例（融合版） | `/srv/llama_agent/start-llama-fused.sh` |
+| 原生 prism（无 KVMem、无视觉，131072 ctx） | `$REPO/deploy/start-llama-prism.sh` |
+| 有 KVMem、无视觉 | `（旧部署备份）` |
+| 测试实例（14805，融合版） | `PORT=14805 $REPO/deploy/start-llama.sh` |
 
 ### 4.6 KV 空闲 TTL 与手动清理
 
@@ -455,7 +496,7 @@ bdd446f server : add KVMem idle TTL eviction and memory pressure guard
 
 | 脚本 | 用途 |
 |---|---|
-| `bench_128k.py` | 128K prefill/decode（连 14805，test-key） |
+| `bench_128k.py` | 128K prefill/decode（`--port/--key`，默认 14802） |
 | `bench_256k.py` | 256K prefill/decode |
 | `bench_agent_8turn.py` | 8 轮 Agent 轨迹，输出逐轮 TTFT 与总耗时 |
 | `bench_quality_100k.py` | 100K 文档开头事实检索（`ORANGE-FALCON-42`） |
@@ -463,13 +504,17 @@ bdd446f server : add KVMem idle TTL eviction and memory pressure guard
 | `test_vision.py` | 图片 OCR/描述，输出 TTFT 与文本 |
 | `repro_prefix_reuse.py` | 长请求后短前缀复用（hole 回归） |
 | `repro_multimodal_reuse.py` | 图像请求后文本前缀复用（hole 回归） |
+| `deploy/start-llama.sh` | 生产启动（env：MODEL/MMPROJ/API_KEY） |
+| `deploy/start-llama-prism.sh` | 回滚：无 KVMem/视觉，131072 ctx |
+| `deploy/trim_proxy.mjs` | 14802 代理（断连中止、tool 裁剪、灰度预留） |
+| `deploy/download-models.sh` | 从 Hugging Face 下载模型与视觉塔 |
 
 用法示例：
 
 ```bash
 python3 docs/kvmem-prism/scripts/bench_agent_8turn.py /tmp/traj.json --port 14802 --key "$KEY"
 python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
-  --image /workspace/phototest/R-C.jpg --prompt "描述这张图片。" --max-tokens 600
+  --image $IMAGE_DIR/R-C.jpg --prompt "描述这张图片。" --max-tokens 600
 ```
 
 
@@ -496,6 +541,33 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 2. 多模态长对话（超过 33K）目前会退回 KVMem 换页，可观察图像后持续的文本轮次质量。
 3. 16 GB 单卡无法双实例，灰度验证建议准备第二块 GPU 或安排维护窗口做全量切换。
 4. 视觉若遇到 V100 精度问题，启动加 `--no-mmproj-offload`，并对比同一图片的 OCR 结果。
+
+
+## 14. 上传 GitHub 前检查
+
+本仓库已做以下准备：
+
+- **秘密**：仓库内不含 API key；`API_KEY` 通过环境变量或仓库外的 `api_key.txt` 提供，`.gitignore` 已排除 `api_key.txt`、`*.key`、`.env`。
+- **权重**：`*.gguf` 默认忽略；`git ls-files '*.gguf'` 只应列出上游词表夹具 `models/ggml-vocab-*.gguf`。
+- **构建产物**：`build-sm70/` 已从索引移除；`.gitignore` 覆盖 `/build*/`、`*.so`、`*.o`、日志与运行状态。
+- **许可证**：MIT（`LICENSE`），上游 `AUTHORS` / `CONTRIBUTING.md` 保留。
+
+上传前建议自查：
+
+```bash
+git grep -n -E 'api_key|Bearer [A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{16,}' -- .
+git ls-files '*.gguf' | head
+git ls-files -z | xargs -0 du -h | sort -rh | head -10
+```
+
+历史体积说明：本次清理前的提交仍包含 `build-sm70`（`.git` 约 194 MB）。若需要轻量仓库，可在**备份后**重写历史：
+
+```bash
+git filter-repo --path build-sm70 --invert-paths
+git gc --prune=now --aggressive
+```
+
+或只推送一个干净的 squash 分支。注意重写后 README 里的历史 commit hash 会失效。
 
 
 ## 13. 验收结论（2026-11-07 收口）

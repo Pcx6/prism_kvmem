@@ -1,3 +1,59 @@
-build-sm70/
-g2_*.log
-g4opt_*.log
+# Build trees and compiled artifacts
+/build*/
+/cmake-build-*/
+/out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Local logs, benchmark output and run state
+*.log
+*.out
+*.jsonl
+*.pid
+*.tmp
+/slots/
+/fused_prod.log
+/trim_14802.log
+
+# Model weights and projectors: download separately, never commit
+*.gguf
+!models/ggml-vocab-*.gguf
+*.gguf.out
+
+# Secrets and local configuration
+api_key.txt
+api_key
+*.key
+*.pem
+*.crt
+.env
+.env.*
+secrets/
+config.local.*
+*.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Rust / misc
+target/
+node_modules/

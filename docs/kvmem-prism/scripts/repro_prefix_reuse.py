@@ -1,6 +1,8 @@
-import json, time, urllib.request, sys
+#!/usr/bin/env python3
+"""Prefix reuse regression: long prompt, then a shorter prompt sharing a prefix."""
+import json, os, time, urllib.request, sys
 port=sys.argv[1]; key=sys.argv[2]; ngen=int(sys.argv[3]) if len(sys.argv)>3 else 600
-base=open('/tmp/p128k.txt').read()
+base=open(os.environ.get('PROMPT_FILE', 'prompt_128k.txt'), encoding='utf-8').read()
 headers={'Content-Type':'application/json','Authorization':'Bearer '+key}
 def tok(text):
     req=urllib.request.Request(f'http://127.0.0.1:{port}/tokenize', data=json.dumps({'content':text}).encode(), headers=headers)

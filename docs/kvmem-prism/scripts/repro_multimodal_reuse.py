@@ -1,7 +1,11 @@
-import base64, json, time, urllib.request, sys
+#!/usr/bin/env python3
+"""Multimodal reuse regression: image request, then a shorter text request."""
+import base64, json, os, time, urllib.request, sys
 port=sys.argv[1]; key=sys.argv[2]
-img='/workspace/phototest/微信图片_20261010203406_5_8.jpg'
-base=open('/tmp/p128k.txt').read()
+img=os.environ.get('IMAGE_FILE')
+if not img:
+    raise SystemExit('set IMAGE_FILE to a jpg/png path')
+base=open(os.environ.get('PROMPT_FILE', 'prompt_128k.txt'), encoding='utf-8').read()
 headers={'Content-Type':'application/json','Authorization':'Bearer '+key}
 def tok(text):
     req=urllib.request.Request(f'http://127.0.0.1:{port}/tokenize', data=json.dumps({'content':text}).encode(), headers=headers)
