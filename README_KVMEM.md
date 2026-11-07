@@ -543,33 +543,6 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 4. 视觉若遇到 V100 精度问题，启动加 `--no-mmproj-offload`，并对比同一图片的 OCR 结果。
 
 
-## 14. 上传 GitHub 前检查
-
-本仓库已做以下准备：
-
-- **秘密**：仓库内不含 API key；`API_KEY` 通过环境变量或仓库外的 `api_key.txt` 提供，`.gitignore` 已排除 `api_key.txt`、`*.key`、`.env`。
-- **权重**：`*.gguf` 默认忽略；`git ls-files '*.gguf'` 只应列出上游词表夹具 `models/ggml-vocab-*.gguf`。
-- **构建产物**：`build-sm70/` 已从索引移除；`.gitignore` 覆盖 `/build*/`、`*.so`、`*.o`、日志与运行状态。
-- **许可证**：MIT（`LICENSE`），上游 `AUTHORS` / `CONTRIBUTING.md` 保留。
-
-上传前建议自查：
-
-```bash
-git grep -n -E 'api_key|Bearer [A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{16,}' -- .
-git ls-files '*.gguf' | head
-git ls-files -z | xargs -0 du -h | sort -rh | head -10
-```
-
-历史体积说明：本次清理前的提交仍包含 `build-sm70`（`.git` 约 194 MB）。若需要轻量仓库，可在**备份后**重写历史：
-
-```bash
-git filter-repo --path build-sm70 --invert-paths
-git gc --prune=now --aggressive
-```
-
-或只推送一个干净的 squash 分支。注意重写后 README 里的历史 commit hash 会失效。
-
-
 ## 13. 验收结论（2026-11-07 收口）
 
 | 目标 | 结果 |
@@ -585,3 +558,37 @@ git gc --prune=now --aggressive
 | 稳定性 | 修复后 0 `hole`、0 `Context size exceeded`、0 `prepare_reject` |
 | 长期运行 | 单卡 16 GB，显存峰值 10.8 GB，余量 5 GB+ |
 | KV 空闲回收 | TTL 到期后 250K 会话 RSS 17.96 GB -> 1.33 GB（释放 16.6 GB）；TTL=0 可禁用 |
+
+
+## 14. 上传 GitHub 前检查
+
+本仓库已做以下准备：
+
+- **秘密**：仓库内不含 API key；`API_KEY` 通过环境变量或仓库外的 `api_key.txt` 提供，`.gitignore` 已排除 `api_key.txt`、`*.key`、`.env`（`.env.example` 保留）。
+- **权重**：`*.gguf` 默认忽略；`git ls-files '*.gguf'` 只应列出上游词表夹具 `models/ggml-vocab-*.gguf`。
+- **构建产物**：`build-sm70/` 已从索引移除；`.gitignore` 覆盖 `/build*/`、`*.so`、`*.o`、日志与运行状态。
+- **许可证**：MIT（`LICENSE`），上游 `AUTHORS` / `CONTRIBUTING.md` 保留。
+- **当前体积**：工作树跟踪文件约 12 MB；`.git` 约 156 MB（历史中包含旧构建产物）。
+
+上传前建议自查：
+
+```bash
+git grep -n -E 'api_key|Bearer [A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{16,}' -- .
+git ls-files '*.gguf' | head
+git ls-files -z | xargs -0 du -h | sort -rh | head -10
+```
+
+若需要轻量仓库，可在**备份后**重写历史（会改变所有 commit hash，README 中的历史 hash 随之失效）：
+
+```bash
+git filter-repo --path build-sm70 --invert-paths
+git gc --prune=now --aggressive
+```
+
+或只推送一个干净的 squash 分支：
+
+```bash
+git checkout --orphan clean-main
+git add -A && git commit -m "Import KVMem x Prism production fork"
+git push -u origin clean-main     # 分支名按需修改
+```
