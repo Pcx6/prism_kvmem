@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-kvmem-off:
+    name: build llama-server (LLAMA_KVMEM=OFF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 4 --target llama-server
+
+  hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No patch leftovers
+        run: |
+          if git ls-files | grep -E '\.(rej|orig)$'; then
+            echo "patch leftovers found"; exit 1
+          fi
+      - name: No model weights or build trees tracked
+        run: |
+          if git ls-files | grep -E '^(build|models/[^/]+\.gguf$)' ; then
+            echo "unexpected build or weight files"; exit 1
+          fi
