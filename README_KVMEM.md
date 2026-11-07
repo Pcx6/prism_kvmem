@@ -16,9 +16,10 @@
 | KVMem | `--kvmem --kvmem-budget 12288 --kvmem-gen-reserve 22528`（GPU 池 34816 token） |
 | 短路阈值 | `0.95 x pool = 33075` token，低于此值走原生注意力快速路径 |
 | 显存 | 启动 9395 MiB（含视觉），峰值约 9.7-9.9 GB / 16 GB |
-| 长文 | 128K prefill 约 573 t/s，256K 约 543 t/s（换页开启） |
+| 长文 | 128K prefill 约 564 t/s，250K 约 546 t/s（换页开启） |
 | 短请求 | 32K 冷启动约 690 t/s；8 轮 Agent 23-24 s（总 TTFT 13.6-14.1 s） |
 | 视觉 | OCR 与图片描述正常，TTFT 1.0-3.6 s，单图 8-29 s |
+| KV 空闲回收 | `--kvmem-idle-ttl 86400`（1 天）；到期释放 host KV，日志 `KVMEM_IDLE_EVICT` |
 | 回滚 | `/srv/llama_agent/start-llama-14803-prism.sh`（原生 prism，无 KVMem/视觉） |
 
 
@@ -83,6 +84,40 @@ cmake --build build-sm70 -j 12 --target llama-server
 
 ## 4. 运行
 
+### 4.0 快速上手（5 步）
+
+```bash
+# 1. 构建（首次或改代码后）
+cd /workspace/prism_kvmem
+cmake -B build-sm70 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=/workspace/baseline_llama/src/kvmem-root \
+  -DLLAMA_BUILD_SERVER=ON -DGGML_NATIVE=ON
+cmake --build build-sm70 -j 12 --target llama-server
+
+# 2. 启动推理服务（14803，KVMem + 视觉 + TTL 1 天）
+nohup setsid /srv/llama_agent/start-llama-14803.sh \
+  > /srv/llama_agent/fused_prod.log 2>&1 &
+
+# 3. 启动代理（14802，公网入口）
+cd /srv/harness_agent
+TRIM_API_KEY=$(cat /srv/llama_agent/api_key.txt) UPSTREAM=http://127.0.0.1:14803 \
+  LISTEN_HOST=0.0.0.0 LISTEN_PORT=14802 nohup setsid node trim_proxy.mjs \
+  > /srv/harness_agent/trim_14802.log 2>&1 &
+
+# 4. 健康检查
+KEY=$(cat /srv/llama_agent/api_key.txt)
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:14803/health   # 200
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:14802/health   # 200
+
+# 5. 发请求
+curl -s http://127.0.0.1:14802/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"Bonsai-2-27B","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
+```
+
+停止服务：`pgrep -a -x llama-server` 找到 pid 后 `kill -9`；代理同理按 LISTEN_PORT=14802 精确杀。
+空闲 KV 清理：默认 1 天（`--kvmem-idle-ttl 86400`），会释放 host 内存；不等 TTL 时可用 `POST /slots/0?action=erase` 立即清空（见 4.6）。
+
 ### 4.1 生产启动
 
 `/srv/llama_agent/start-llama-14803.sh`：
@@ -99,7 +134,8 @@ exec /workspace/prism_kvmem/build-sm70/bin/llama-server \
   -a Bonsai-2-27B \
   -c 262144 -ngl 99 -t 24 -np 1 --reasoning on \
   -ub 1024 -b 4096 -fa on --cache-reuse 256 --slot-save-path /srv/llama_agent/slots \
-  --kvmem --kvmem-budget 12288 --kvmem-gen-reserve 22528 \
+  --cache-ram 0 -ctxcp 0 \
+  --kvmem --kvmem-budget 12288 --kvmem-gen-reserve 22528 --kvmem-idle-ttl 86400 \
   --host 127.0.0.1 --port 14803 --api-key "$KEY"
 ```
 
@@ -153,6 +189,25 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader   # 期望 9-10 GB
 | 原生 prism（无 KVMem、无视觉，131072 ctx） | `/srv/llama_agent/start-llama-14803-prism.sh` |
 | 有 KVMem、无视觉 | `/srv/llama_agent/start-llama-14803.sh.bak-mmproj` |
 | 14805 测试实例（融合版） | `/srv/llama_agent/start-llama-fused.sh` |
+
+### 4.6 KV 空闲 TTL 与手动清理
+
+```bash
+# 默认 1 天；测试可用 10 秒；0 关闭
+--kvmem-idle-ttl 86400     # 生产
+--kvmem-idle-ttl 10        # 验证
+--kvmem-idle-ttl 0         # 禁用
+
+# 立即清空 slot 0 的 KV（行/块）；host RSS 由 TTL 路径归还
+curl -X POST -H "Authorization: Bearer $KEY" \
+  "http://127.0.0.1:14803/slots/0?action=erase"
+```
+
+- 扫描周期约 1 秒（队列空闲 tick），只处理 `state == IDLE` 的 slot。
+- 超时后 `prompt_clear()`（KVMem full reset）+ `malloc_trim(0)`，日志 `KVMEM_IDLE_EVICT reason=idle_ttl idle_ms=... n_tokens=...`。
+- 实测释放：64K 会话 RSS 5.63 GB -> 1.27 GB（TTL=5 s）；250K 会话 17.96 GB -> 1.33 GB（TTL=10 s）。
+- OOM 兜底：`MemAvailable < 1.5 GB` 或 GPU free < 1 GB 时强制清理 IDLE slot（`reason=oom_guard`）；decode 分配失败时清理并重试一次（`reason=oom_retry`）。
+- 说明：GPU KV 池是启动时固定分配（约 2.1-2.2 GB），TTL 释放的是池内行和主机内存，不会把池显存归还驱动。
 
 
 ## 5. 参数选型
@@ -289,6 +344,8 @@ OOM 兜底（同一提交）：
 - M-RoPE 图像批次仍会打印 `find_slot: non-consecutive token position ...`（2D 位置本身非连续，属上游行为），不影响正确性。
 - 256K 在池 >34816 时会明显变慢；需要长文速度时保持当前配置。
 - 进程忽略 SIGTERM，清理用 `kill -9`。
+- KV 空闲 TTL 默认 1 天，只清理 IDLE slot；GPU KV 池是固定分配，清理不回退池显存，只释放行与主机内存。
+- RAM prompt cache / 原生 checkpoint 在 KVMem 下被禁用（避免 store 与原生 KV 不一致），跨请求只有 slot 前缀复用。
 
 
 ## 8. 故障档案
@@ -355,6 +412,10 @@ KVMem 的 `seq_pos_min` 返回原生行位置，触发 Prism 的 checkpoint 回�
 | `src/llama-kv-cache.cpp` | 每 cell 的 logical_pos |
 | `tools/mtmd/mtmd-helper{,-common.h}` | 图像 batch 的 `logical_pos` 与 row_0 接口 |
 | `common/common.cpp` | `--kvmem` 参数与默认值 |
+| `common/arg.cpp`, `common/common.h` | `--kvmem-*` 与 `--kvmem-idle-ttl` 参数注册和默认值 |
+| `tools/server/server-queue.{h,cpp}` | 队列空闲 tick（驱动 TTL 扫描） |
+| `tools/server/server-task.h` | 任务级 `should_stop`（客户端断连） |
+| `src/llama-kvmem-hooks.h`（adapter） | `remove_logical` / `truncate_cached` / `store_*` 等钩子 |
 
 主要提交（由旧到新）：
 
@@ -423,6 +484,10 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 | `cache_reuse is not supported by this context` | KVMem 禁用了 cache-reuse（预期） |
 | `failed to prepare KVMem attention ubatches` | 行号/位置不一致（8.1/8.2 已修） |
 | `completion leaves a hole or exceeds reservation` | 完成围栏拒绝（8.1 已修） |
+| `KVMEM_IDLE_EVICT reason=idle_ttl ...` | TTL 到期清理空闲 slot 的 KV |
+| `KVMEM_IDLE_EVICT reason=oom_guard/oom_retry ...` | 内存不足兜底清理 |
+| `client disconnected, releasing slot` | 客户端断连，服务端停止生成 |
+| `[abort] #N client closed connection` | 代理检测到客户端断开并销毁上游请求 |
 
 
 ## 12. 后续建议
@@ -433,7 +498,7 @@ python3 docs/kvmem-prism/scripts/test_vision.py --port 14802 --key "$KEY" \
 4. 视觉若遇到 V100 精度问题，启动加 `--no-mmproj-offload`，并对比同一图片的 OCR 结果。
 
 
-## 13. 验收结论（2026-11-06 收口）
+## 13. 验收结论（2026-11-07 收口）
 
 | 目标 | 结果 |
 |---|---|
