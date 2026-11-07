@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem with the KVMem + Prism build
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please include the exact command, versions and relevant logs.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Command used, expected behavior and actual behavior.
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: GPU, driver, CUDA version, commit, model and mmproj paths.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell
