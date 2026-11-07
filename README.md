@@ -13,6 +13,7 @@ curl -fL https://github.com/Pcx6/prism_kvmem/releases/download/v0.1.0/quickstart
 自定义：`PORT=14803 API_KEY=my-key MODELS=/data/models curl ... | bash`。
 手动构建见第 3 节，Release 说明见 [v0.1.0](https://github.com/Pcx6/prism_kvmem/releases/tag/v0.1.0)。
 如需在执行前审查脚本内容，请查看 [quickstart.sh](https://raw.githubusercontent.com/Pcx6/prism_kvmem/main/quickstart.sh) 源码。
+Release 资产 `prism_kvmem-v0.1.0-linux-sm70.tar.gz` 的 SHA256：`da4e917a2fdd62d2a30d25f488d674c0a41d24692d3a21679f83504bb928a30d`（下载后可用 `sha256sum` 校验）。
 
 
 本仓库是 Prism（qwen35 架构 27B 三值量化模型）的 llama.cpp 分支，把 KVMem 主机侧 KV 换页适配器编译进 Prism，并在此基础上完成：
