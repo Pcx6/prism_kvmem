@@ -1,5 +1,19 @@
 # Prism x KVMem 生产融合说明
 
+[![Release](https://img.shields.io/github/v/release/Pcx6/prism_kvmem)](https://github.com/Pcx6/prism_kvmem/releases)
+
+## 快速安装（一键启动）
+
+```bash
+curl -fL https://github.com/Pcx6/prism_kvmem/releases/download/v0.1.0/quickstart.sh | bash
+```
+
+要求：Linux x86_64、NVIDIA **sm_70（V100）** 或兼容驱动、Python 3、约 8 GB 磁盘。
+脚本会下载二进制包（57 MB）与模型/视觉塔（约 6.2 GB），生成随机 API key，并在 `14803` 启动服务。
+自定义：`PORT=14803 API_KEY=my-key MODELS=/data/models curl ... | bash`。
+手动构建见第 3 节，Release 说明见 [v0.1.0](https://github.com/Pcx6/prism_kvmem/releases/tag/v0.1.0)。
+
+
 本仓库是 Prism（qwen35 架构 27B 三值量化模型）的 llama.cpp 分支，把 KVMem 主机侧 KV 换页适配器编译进 Prism，并在此基础上完成：
 请求级检索 span 注入、短上下文短路、前缀复用、多模态视觉、以及生产部署 14803 的运维脚本。
 
@@ -47,8 +61,10 @@
 
 ### 0.3 首次准备
 
+推荐直接用 Release 的一键脚本（见文首）。源码方式：
+
 ```bash
-git clone <this repo> && cd prism_kvmem
+git clone https://github.com/Pcx6/prism_kvmem.git && cd prism_kvmem
 cp .env.example .env          # 填入 MODEL/MMPROJ/API_KEY（.env 已被 .gitignore）
 ./deploy/download-models.sh   # 默认下载到 models/
 set -a; . ./.env; set +a
