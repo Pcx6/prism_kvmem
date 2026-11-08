@@ -152,10 +152,19 @@ function authorized(headers) {
 const agent = new URL(UPSTREAM).protocol === 'https:' ? https : http;
 const stats = { requests: 0, denied: 0, trimmed: 0, bytesIn: 0, bytesOut: 0 };
 
+function is_ui_request(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  const p = String(req.url || '/').split('?')[0];
+  if (p === '/' || p === '/index.html' || p === '/manifest.webmanifest' || p === '/sw.js' || p === '/props') return true;
+  if (p.startsWith('/_app/')) return true;
+  if (/^\/(favicon|apple-)[^/]*$/.test(p)) return true;
+  return /^\/[^/]+\.(js|css|png|jpe?g|svg|ico|json|webmanifest|woff2?|ttf|map)$/.test(p);
+}
+
 const server = http.createServer((req, res) => {
   req.setTimeout(120000, () => req.destroy());
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-  if (!authorized(req.headers)) {
+  if (!authorized(req.headers) && !is_ui_request(req)) {
     stats.denied += 1;
     res.writeHead(401, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'invalid or missing API key', type: 'auth_error' } }));
@@ -211,6 +220,9 @@ const server = http.createServer((req, res) => {
     const upstreamBase = pickUpstream(req.headers, parsed);
     const up = new URL(upstreamBase + req.url);
     const headers = { ...req.headers, host: up.host };
+    if (is_ui_request(req) && String(req.url || "").split("?")[0] === "/props" && !headers["authorization"] && !headers["x-api-key"]) {
+      headers["authorization"] = "Bearer " + API_KEY;
+    }
     for (const h of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
                      'te', 'trailer', 'transfer-encoding', 'upgrade']) {
       delete headers[h];
