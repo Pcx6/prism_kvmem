@@ -92,15 +92,15 @@ set -a; . ./.env; set +a
 
 | 项目 | 值 |
 |---|---|
-| 模型 | `/srv/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf`（10.1 GB，qwen35 hybrid GDN，262144 ctx，文本） |
-| 视觉塔 | 无（Qwen3.8-27B 为纯文本，已移除 mmproj） |
+| 模型 | `/srv/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`（10.4 GB，qwen35 hybrid GDN + MTP head，262144 ctx） |
+| 视觉塔 | `/srv/models/mmproj-Qwen3.8-27B-BF16.gguf`（931 MB，GPU offload） |
 | API 名称 | `Bonsai-2-27B`（启动参数 `-a Bonsai-2-27B`） |
-| KVMem | `--kvmem --kvmem-budget 8192 --kvmem-gen-reserve 12288`（GPU 池 20480 token，约 1.25 GiB） |
-| 短路阈值 | `0.95 x pool = 19456` token，低于此值走原生注意力快速路径 |
-| 显存 | 启动约 11.5 GiB；长上下文峰值 12.98 GiB / 16 GB |
-| 长文 | 128K 约 601 t/s，226K 约 589 t/s（换页开启） |
-| 短请求 | 8 轮 Agent 30.0 s（总 TTFT 16.4 s）；32K 以上走 KVMem 换页 |
-| 视觉 | 不适用（文本模型） |
+| KVMem | `--kvmem --kvmem-budget 6144 --kvmem-gen-reserve 12288`（GPU 池 18432 token，约 1.125 GiB） |
+| 短路阈值 | `0.95 x pool = 17510` token，低于此值走原生注意力快速路径 |
+| 显存 | 启动 12.57 GiB；226K 峰值 14.08 GiB / 16 GB（余 1.92 GiB） |
+| 长文 | 117K 约 549 t/s，226K 约 535 t/s（换页开启） |
+| 短请求 | 代码 700 token decode 61.1 t/s；8 轮 Agent 27.5 s（TTFT 17.9 s） |
+| 视觉 | OCR 正常（14802），TTFT 3.9 s，decode 65.2 t/s |
 | KV 空闲回收 | `--kvmem-idle-ttl 86400`（1 天）；到期释放 host KV，日志 `KVMEM_IDLE_EVICT` |
 | 回滚 | `$REPO/deploy/start-llama-prism.sh`（原生 prism，无 KVMem/视觉） |
 
@@ -717,3 +717,39 @@ git push -u origin clean-main     # 分支名按需修改
 - 基准脚本必须显式 `cache_prompt=false`；否则会复用上一个 226K 请求前缀，导致 `Context size has been exceeded`。`bench_quality_100k.py` 已修正。
 - 池 20480 表示 32K 请求走 KVMem 换页（阈值 19456），不再有 33K 原生短路；如需更大短路池，可在峰值余量内提高预算并重新压测。
 - 14802 保持 `ROUTING_MODE=prism_only`，双后端路由保留备用。
+
+## 17. MTP 投机解码 + 视觉（2026-11-15）
+
+### 17.1 最终配置
+
+- 模型：`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`（含 nextn MTP head）+ `mmproj-Qwen3.8-27B-BF16.gguf`
+- `--spec-type draft-mtp --spec-draft-n-max 2`；`--cache-type-k q8_0 --cache-type-v q8_0`
+- `--kvmem --kvmem-budget 6144 --kvmem-gen-reserve 12288`（池 18432，短路阈值 17510）
+- `--reasoning on` 全程保留；`-c 262144 -fa on -ub 1024 -b 4096`
+- 回滚：`cp /srv/llama_agent/start-llama-14803.sh.bak-qwen38 /srv/llama_agent/start-llama-14803.sh`
+
+### 17.2 关键结果
+
+| 场景 | 结果 |
+|---|---|
+| 700 token 代码（含思维链） | **61.1 tok/s**，draft 接受率 73.3% |
+| 8 轮 Agent（14802） | 27.5 s，TTFT 17.9 s，后段 49-50 tok/s |
+| OCR（14802） | 文字正确，TTFT 3.9 s，65.2 tok/s |
+| 117K ORANGE 检索 | prefill 548.6 tok/s，decode 61.7 tok/s，正确返回 |
+| 226K | prefill 535.2 tok/s，峰值 14417 MiB，draft 在深上下文空闲 |
+| 断连 | GPU 立即 0%，slot 释放，后续 200 |
+
+### 17.3 参数矩阵（700 token，T=0）
+
+| n-max | KV | pool | tok/s | 接受率 | 峰值 MiB |
+|---|---|---|---|---|---|
+| off | f16 | 20480 | 33-35 | - | 12977 |
+| 1 | f16 | 20480 | 55.9 | 79.7% | 13841 |
+| 2 | f16 | 20480 | 59.1 | 67.5% | 13993 |
+| 3 | f16 | 20480 | 56.8 | 56.8% | 14145 |
+| 2 | q8_0 | 20480 | 61.0 | 73.3% | 13375 |
+| 2 | q8_0 | 18432 | **61.2** | 73.3% | 13291 |
+
+结论：n-max 2 + q8_0 + 池 18432 最优；视觉同时开启不影响短文本速度。
+
+完整数据：`/srv/llama_agent/logs/final_bench.md`。
