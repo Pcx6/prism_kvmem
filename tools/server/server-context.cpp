@@ -1024,8 +1024,7 @@ private:
             SRV_WRN("%s\n", "KVMem request span is process-wide; -np > 1 is not supported");
         }
         if (params.kvmem && has_spec) {
-            SRV_ERR("%s\n", "KVMem does not support speculative decoding; disable speculative decoding or KVMem");
-            return false;
+            SRV_WRN("%s\n", "KVMem + speculative decoding is experimental; watch for hole/decode errors");
         }
 
         if (callback_state) {
