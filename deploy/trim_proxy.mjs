@@ -31,6 +31,9 @@ const API_KEY = process.env.TRIM_API_KEY;
 const UPSTREAM_GRAY = process.env.UPSTREAM_GRAY || '';
 const GRAYSCALE_PERCENT = Number(process.env.GRAYSCALE_PERCENT || 0);
 const TRIM_DEBUG = process.env.TRIM_DEBUG === '1';
+const VLLM_UPSTREAM = process.env.VLLM_UPSTREAM || 'http://127.0.0.1:14806';
+const ROUTING_MODE = process.env.ROUTING_MODE || 'prism_only'; // prism_only | auto
+const VLLM_MAX_LEN = Number(process.env.VLLM_MAX_LEN || 8192);
 const MAX_BODY = Number(process.env.TRIM_MAX_BODY || 64 * 1024 * 1024);
 const GRAY_SALT = process.env.TRIM_GRAY_SALT || '';
 if (!(MAX > HEAD + TAIL)) {
@@ -60,6 +63,45 @@ export function pickUpstream(headers, parsed) {
   if (!UPSTREAM_GRAY || GRAYSCALE_PERCENT <= 0) return UPSTREAM;
   if (!GRAY_SALT) return UPSTREAM;
   return bucketOf(sessionKey(headers || {}, parsed)) < GRAYSCALE_PERCENT ? UPSTREAM_GRAY : UPSTREAM;
+}
+
+function contentTokens(parsed) {
+  let chars = 0;
+  const walk = (v) => {
+    if (typeof v === 'string') chars += v.length;
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') Object.values(v).forEach(walk);
+  };
+  walk(parsed && parsed.messages);
+  walk(parsed && parsed.prompt);
+  return Math.ceil(chars / 4);
+}
+
+function hasMedia(parsed) {
+  let found = false;
+  const walk = (v) => {
+    if (found) return;
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== 'object') return;
+    if (v.type === 'image_url' || v.type === 'input_image' || v.type === 'audio_url' || v.type === 'video_url' || v.image_url || v.input_image) { found = true; return; }
+    Object.values(v).forEach(walk);
+  };
+  walk(parsed && parsed.messages);
+  return found;
+}
+
+function decideBackend(headers, parsed) {
+  const forced = String(headers['x-backend'] || '').toLowerCase();
+  if (forced === '1cat' || forced === 'vllm') return 'vllm';
+  if (forced === 'prism') return 'prism';
+  if (ROUTING_MODE !== 'auto') return 'prism';
+  const model = parsed && String(parsed.model || '').toLowerCase();
+  if (model === '1cat-vllm' || model === 'qwen3.8-27b') return 'vllm';
+  if (String(headers['x-mtp'] || '') === '1' || (parsed && parsed.mtp === true)) return 'vllm';
+  if (hasMedia(parsed)) return 'prism';
+  if (contentTokens(parsed) > VLLM_MAX_LEN) return 'prism';
+  if (parsed && parsed.stream === true) return 'vllm';
+  return 'prism';
 }
 
 export function trimText(text) {
@@ -217,7 +259,8 @@ const server = http.createServer((req, res) => {
         }
       } catch { /* unparsable body: forward untouched */ }
     }
-    const upstreamBase = pickUpstream(req.headers, parsed);
+    const backend = decideBackend(req.headers, parsed);
+    const upstreamBase = backend === 'vllm' ? VLLM_UPSTREAM : pickUpstream(req.headers, parsed);
     const up = new URL(upstreamBase + req.url);
     const headers = { ...req.headers, host: up.host };
     if (is_ui_request(req) && String(req.url || "").split("?")[0] === "/props" && !headers["authorization"] && !headers["x-api-key"]) {
@@ -229,7 +272,10 @@ const server = http.createServer((req, res) => {
     }
     delete headers['content-length'];
     headers['content-length'] = String(body.length);
-    if (upstreamBase !== UPSTREAM) {
+    if (backend === 'vllm') {
+      stats.vllm = (stats.vllm || 0) + 1;
+      process.stderr.write('[route] #' + stats.requests + ' -> vllm ' + upstreamBase + '\n');
+    } else if (upstreamBase !== UPSTREAM) {
       stats.gray = (stats.gray || 0) + 1;
       process.stderr.write('[gray] #' + stats.requests + ' -> ' + upstreamBase + '\n');
     }
@@ -239,7 +285,7 @@ const server = http.createServer((req, res) => {
         path: up.pathname + up.search, method: req.method, headers },
       (upstreamRes) => {
         // Streaming pass-through: headers first, then raw chunks. No buffering, no re-chunking.
-        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+        res.writeHead(upstreamRes.statusCode || 502, { ...upstreamRes.headers, 'x-backend': backend });
         res.flushHeaders?.();
         upstreamRes.pipe(res, { end: true });
       });
@@ -254,7 +300,7 @@ const server = http.createServer((req, res) => {
 if (process.env.PROXY_LIB_ONLY !== '1') {
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     process.stdout.write('[trim] listening on ' + LISTEN_HOST + ':' + LISTEN_PORT + ' -> ' + UPSTREAM +
-      ' (max=' + MAX + ' head=' + HEAD + ' tail=' + TAIL + ')\n');
+      ' (max=' + MAX + ' head=' + HEAD + ' tail=' + TAIL + ' routing=' + ROUTING_MODE + ')\n');
   });
 }
 export { server, stats, API_KEY };
