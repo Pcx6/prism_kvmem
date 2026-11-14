@@ -647,3 +647,43 @@ git checkout --orphan clean-main
 git add -A && git commit -m "Import KVMem x Prism production fork"
 git push -u origin clean-main     # 分支名按需修改
 ```
+
+## 15. 双后端路由（14803 Prism / 14806 1Cat-vLLM）
+
+14802 代理支持按请求选择后端。**默认 `prism_only`，1Cat 不接生产流量。**
+
+### 15.1 配置
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `ROUTING_MODE` | `prism_only` | `prism_only` 全走 14803；`auto` 启用自动规则 |
+| `VLLM_UPSTREAM` | `http://127.0.0.1:14806` | 1Cat-vLLM 地址 |
+| `VLLM_MAX_LEN` | `8192` | auto 模式下超过该 token 估算值走 Prism |
+
+### 15.2 路由规则
+
+| 条件 | 后端 | 说明 |
+|---|---|---|
+| Header `x-backend: 1cat` / `vllm` | 14806 | 强制测试 1Cat |
+| Header `x-backend: prism` | 14803 | 强制 Prism |
+| `model` = `1cat-vllm` / `qwen3.8-27b` | 14806 | 仅 `auto` |
+| Header `x-mtp: 1` 或 body `mtp: true` | 14806 | 仅 `auto`，MTP 请求 |
+| 包含图片/音频/视频内容 | 14803 | 仅 `auto`；多模态归 Prism |
+| 估算 token > `VLLM_MAX_LEN` | 14803 | 仅 `auto`；长上下文归 Prism |
+| `stream: true` 且短请求 | 14806 | 仅 `auto` |
+| 其它 | 14803 | 默认 |
+
+响应头带 `x-backend: prism|vllm`，便于调试。SSE 流式原样透传。
+
+### 15.3 当前状态（2026-11-14）
+
+- 1Cat-vLLM **未部署**：GitHub release 资产下载被限速（285 MB wheel 约 160 KB/s），且 wheel 要求 Python 3.12 + Torch 2.10（本机仅 3.13）；GGUF 支持需 1Cat 开发版源码构建。
+- 模型已就绪：`/srv/models/Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf`（10,094,357,632 字节，经 HF 镜像下载）。
+- 单卡 16 GB 无法双驻留：Prism 启动约 9.4 GB + IQ3_XXS 权重 10.1 GB = **19.5 GB**，超过红线 15.5 GB；1Cat 另需 KV/激活显存。
+- 因此 `ROUTING_MODE=prism_only`，`x-backend: 1cat` 在 14806 未启动时返回 502（符合预期）。
+
+### 15.4 启用条件
+
+1. 安装 1Cat-vLLM（CPython 3.12 + Torch 2.10 + CUDA 12.8），启动 `--port 14806 --api-key <same-key>`。
+2. 显存方案：第二块 GPU，或单独运行（停止 Prism）后把 `ROUTING_MODE=auto` 或使用 `x-backend: 1cat` 测试。
+3. 切换前先做短文本并发、长文本、多模态回归；确认后再改 `ROUTING_MODE`。
