@@ -204,7 +204,7 @@ function is_ui_request(req) {
 }
 
 const server = http.createServer((req, res) => {
-  req.setTimeout(120000, () => req.destroy());
+  req.setTimeout(0); // long prefills must not be cut by an idle timeout
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
   if (!authorized(req.headers) && !is_ui_request(req)) {
     stats.denied += 1;
@@ -297,6 +297,8 @@ const server = http.createServer((req, res) => {
   });
 });
 
+server.requestTimeout = 0;
+server.headersTimeout = 60000;
 if (process.env.PROXY_LIB_ONLY !== '1') {
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     process.stdout.write('[trim] listening on ' + LISTEN_HOST + ':' + LISTEN_PORT + ' -> ' + UPSTREAM +
